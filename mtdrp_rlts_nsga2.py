@@ -2,20 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-MTDRP问题的RLTS-NSGA-II求解器
-
 基于论文: "Drone routing with energy function: Formulation and exact algorithm"
 使用改进的RLTS-NSGA-II算法求解多行程无人机路径问题
 
-算法特点:
-1. Q-learning自适应参数调节
-2. 基于关键路径的禁忌搜索局部优化
-3. 多目标优化: 最小化总成本 + 最小化总能耗
+特点:
+1. 使用NSGA-II多目标优化算法
+2. 集成反应式禁忌搜索(RLTS)进行局部搜索
+3. 支持Q-Learning自适应参数调整
+4. 多目标优化: 最小化总距离和总能耗
+
+能耗模型切换说明:
+- 修改第37行的 USE_TREE_MODEL 变量来切换能耗模型
+- True: 使用TreeBasedEnergyModel (基于LightGBM的机器学习模型)
+- False: 使用NonlinearEnergyModel (基于物理公式的理论模型)
+
 """
 
 import pygmo as pg
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.family'] = 'SimHei'
 import random
 import copy
 import math
@@ -24,11 +31,222 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from mtdrp_energy_model import (
-    MTDRPInstance, MTDRPSolution, MTDRPEvaluator,
-    NonlinearEnergyModel, load_instance, print_instance_info,
+    MTDRPInstance, NonlinearEnergyModel, TreeBasedEnergyModel, load_instance,
     Customer, DroneParameters
 )
 
+
+# ==================== 能耗模型配置 ====================
+
+# 能耗模型选择配置
+# 支持的模型类型: "physical", "linear", "tree", "deep"
+ENERGY_MODEL_TYPE = "deep"  
+
+def create_energy_model(instance: MTDRPInstance):
+    """
+    创建能耗模型的工厂函数
+    
+    参数:
+        instance: MTDRP问题实例
+        
+    返回:
+        能耗模型实例
+    """
+    from mtdrp_energy_model import create_energy_model as create_model
+    
+    try:
+        model = create_model(ENERGY_MODEL_TYPE, instance)
+        return model
+    except Exception as e:
+        print(f"[ERROR] 创建{ENERGY_MODEL_TYPE}模型失败: {e}")
+        print("[INFO] 自动切换到NonlinearEnergyModel作为后备")
+        return NonlinearEnergyModel(instance.drone_params)
+
+
+# ==================== 解的表示与评估 ====================
+
+class MTDRPSolution:
+    """
+    MTDRP解的表示
+    
+    一个解包含多架无人机的多个行程，每个行程是一个客户访问序列
+    """
+    
+    def __init__(self, instance: MTDRPInstance):
+        self.instance = instance
+        # routes[drone_id] = [trip1, trip2, ...], 每个trip是客户ID列表
+        self.routes: Dict[int, List[List[int]]] = {k: [] for k in range(instance.num_drones)}
+        
+    def add_trip(self, drone_id: int, customers: List[int]):
+        """为无人机添加一个行程"""
+        if customers:
+            self.routes[drone_id].append(customers)
+    
+    def get_all_trips(self) -> List[Tuple[int, int, List[int]]]:
+        """获取所有行程 [(drone_id, trip_idx, customers), ...]"""
+        trips = []
+        for drone_id, drone_trips in self.routes.items():
+            for trip_idx, customers in enumerate(drone_trips):
+                trips.append((drone_id, trip_idx, customers))
+        return trips
+    
+    def get_visited_customers(self) -> set:
+        """获取所有被访问的客户"""
+        visited = set()
+        for drone_trips in self.routes.values():
+            for trip in drone_trips:
+                visited.update(trip)
+        return visited
+    
+    def is_complete(self) -> bool:
+        """检查是否所有客户都被访问"""
+        visited = self.get_visited_customers()
+        required = set(c.id for c in self.instance.customers)
+        return visited == required
+
+
+class MTDRPEvaluator:
+    """
+    MTDRP解的评估器，计算目标函数值和约束违反惩罚
+    """
+    
+    def __init__(self, instance: MTDRPInstance):
+        self.instance = instance
+        self.energy_model = create_energy_model(instance)
+        self.customer_map = {c.id: c for c in instance.customers}
+        
+    def evaluate(self, solution: MTDRPSolution) -> Tuple[float, float, Dict]:
+        """
+        评估解的质量
+        
+        返回: (total_cost, total_penalty, details)
+        """
+        total_energy = 0.0
+        total_distance = 0.0
+        total_delay = 0.0
+        penalties = {'unvisited': 0.0, 'capacity': 0.0, 'energy': 0.0, 'time_window': 0.0, 'duplicate': 0.0}
+        visited_customers = set()
+        
+        # 评估每架无人机的每个行程
+        for drone_id, drone_trips in solution.routes.items():
+            for trip in drone_trips:
+                trip_result = self._evaluate_trip(trip, visited_customers)
+                total_energy += trip_result['energy']
+                total_distance += trip_result['distance']
+                total_delay += trip_result['delay']
+                for key in penalties:
+                    penalties[key] += trip_result['penalties'].get(key, 0.0)
+                visited_customers.update(trip)
+        
+        # 检查未访问的客户
+        required = set(c.id for c in self.instance.customers)
+        unvisited = required - visited_customers
+        penalties['unvisited'] = len(unvisited) * 10000.0
+        
+        total_penalty = sum(penalties.values())
+        delta = 1.0  # 能量成本系数
+        total_cost = total_distance + delta * total_energy * 1000
+        
+        details = {
+            'total_energy': total_energy,
+            'total_distance': total_distance,
+            'total_delay': total_delay,
+            'penalties': penalties,
+            'num_trips': sum(len(trips) for trips in solution.routes.values()),
+            'visited_customers': len(visited_customers),
+            'unvisited_customers': len(unvisited)
+        }
+        
+        return total_cost, total_penalty, details
+    
+    def _evaluate_trip(self, trip: List[int], already_visited: set) -> Dict:
+        """评估单个行程"""
+        result = {'energy': 0.0, 'distance': 0.0, 'delay': 0.0, 'penalties': {}}
+        
+        if not trip:
+            return result
+        
+        # 检查重复访问
+        for cust_id in trip:
+            if cust_id in already_visited:
+                result['penalties']['duplicate'] = result['penalties'].get('duplicate', 0) + 5000.0
+        
+        # 计算初始载重
+        total_demand = sum(self.customer_map[cid].demand for cid in trip if cid in self.customer_map)
+        
+        # 检查载重约束
+        if total_demand > self.instance.drone_params.Q:
+            result['penalties']['capacity'] = (total_demand - self.instance.drone_params.Q) * 1000.0
+        
+        # 模拟行程
+        current_node = 0  # depot
+        current_time = 0.0
+        current_payload = total_demand
+        trip_energy = 0.0
+        trip_distance = 0.0
+        
+        for cust_id in trip:
+            if cust_id not in self.customer_map:
+                continue
+            customer = self.customer_map[cust_id]
+            cust_idx = cust_id
+            
+            # 计算到客户的距离和时间
+            dist = self.instance.distance_matrix[current_node, cust_idx]
+            travel_time = self.instance.travel_time_matrix[current_node, cust_idx]
+            
+            # 计算能量消耗（使用当前载重）
+            if hasattr(self.energy_model, 'energy_consumption') and len(self.energy_model.energy_consumption.__code__.co_varnames) > 3:
+                # 物理模型需要 end_time 和 start_time 参数
+                flight_time = travel_time * 60  # 转换为秒
+                energy = self.energy_model.energy_consumption(current_payload, current_time + flight_time, current_time)
+            else:
+                # 其他模型使用标准接口
+                energy = self.energy_model.energy_consumption(current_payload, dist)
+            trip_energy += energy
+            trip_distance += dist
+            
+            # 更新时间
+            arrival_time = current_time + travel_time
+            if arrival_time < customer.earliest_time:
+                current_time = customer.earliest_time + customer.service_time
+            elif arrival_time > customer.latest_time:
+                delay = arrival_time - customer.latest_time
+                result['delay'] += delay
+                result['penalties']['time_window'] = result['penalties'].get('time_window', 0) + delay * 100.0
+                current_time = arrival_time + customer.service_time
+            else:
+                current_time = arrival_time + customer.service_time
+            
+            # 卸货后更新载重
+            current_payload -= customer.demand
+            current_node = cust_idx
+        
+        # 返回depot
+        dist_to_depot = self.instance.distance_matrix[current_node, 0]
+        travel_time_to_depot = self.instance.travel_time_matrix[current_node, 0]
+        
+        if hasattr(self.energy_model, 'energy_consumption') and len(self.energy_model.energy_consumption.__code__.co_varnames) > 3:
+            # 物理模型需要 end_time 和 start_time 参数
+            flight_time_to_depot = travel_time_to_depot * 60  # 转换为秒
+            energy_to_depot = self.energy_model.energy_consumption(current_payload, current_time + flight_time_to_depot, current_time)
+        else:
+            # 其他模型使用标准接口
+            energy_to_depot = self.energy_model.energy_consumption(current_payload, dist_to_depot)
+        trip_energy += energy_to_depot
+        trip_distance += dist_to_depot
+        
+        # 检查电池能量约束
+        if trip_energy > self.instance.drone_params.sigma:
+            result['penalties']['energy'] = (trip_energy - self.instance.drone_params.sigma) * 10000.0
+        
+        result['energy'] = trip_energy
+        result['distance'] = trip_distance
+        
+        return result
+
+
+# ==================== Q-Learning 控制器 ====================
 
 class QLearningMTDRPController:
     """
@@ -314,7 +532,7 @@ class MTDRPProblem:
     def __init__(self, instance: MTDRPInstance):
         self.instance = instance
         self.evaluator = MTDRPEvaluator(instance)
-        self.energy_model = NonlinearEnergyModel(instance.drone_params)
+        self.energy_model = create_energy_model(instance)
         
         self.n_customers = instance.num_customers
         self.n_drones = instance.num_drones
@@ -355,7 +573,7 @@ class MTDRPProblem:
         return (self.lower_bounds, self.upper_bounds)
     
     def get_nobj(self):
-        """目标函数数量: 总成本 + 总能耗"""
+        """目标函数数量: 总距离 + 总能耗"""
         return 2
     
     def get_nec(self):
@@ -435,18 +653,18 @@ class MTDRPProblem:
         """
         计算适应度函数 (多目标)
         
-        目标1: 总成本 (距离 + 能量成本)
-        目标2: 总能耗
+        目标1: 总距离 (飞行距离)
+        目标2: 总能耗 (能量消耗)
         """
         try:
             solution = self._decode_solution(np.array(x))
             cost, penalty, details = self.evaluator.evaluate(solution)
             
-            # 目标1: 总成本 + 惩罚
-            obj1 = cost + penalty
+            # 目标1: 总飞行距离 + 惩罚
+            obj1 = details['total_distance'] + penalty
             
-            # 目标2: 总能耗 + 惩罚
-            obj2 = details['total_energy'] * 1000 + penalty  # 转换为Wh
+            # 目标2: 总能耗 + 惩罚 (转换为Wh)
+            obj2 = details['total_energy'] * 1000 + penalty
             
             return [obj1, obj2]
             
@@ -633,12 +851,12 @@ def solve_mtdrp_rlts_nsga2(instance: MTDRPInstance,
 
 
 def visualize_mtdrp_results(result: Dict, instance: MTDRPInstance, 
-                            save_path: str = "picture_result/mtdrp"):
+                            save_path: str = "result/mtdrp"):
     """
     可视化MTDRP求解结果
     """
     import os
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else "picture_result", exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else "result", exist_ok=True)
     
     import matplotlib
     matplotlib.rcParams['font.family'] = 'SimHei'
@@ -678,15 +896,15 @@ def visualize_mtdrp_results(result: Dict, instance: MTDRPInstance,
     ax3.set_title('帕累托前沿规模进化')
     ax3.grid(True, alpha=0.3)
     
-    # 帕累托前沿
+    # 帕累托前沿（目标空间）
     ax4 = axes[1, 1]
     if pareto_front:
-        costs = [s['cost'] for s in pareto_front]
-        energies = [s['energy'] * 1000 for s in pareto_front]
-        ax4.scatter(costs, energies, c='purple', s=50, alpha=0.7)
-        ax4.set_xlabel('总成本')
-        ax4.set_ylabel('总能耗 (Wh)')
-        ax4.set_title('帕累托前沿')
+        obj1 = [s['fitness'][0] for s in pareto_front]  # 目标1: 总距离 + 惩罚
+        obj2 = [s['fitness'][1] for s in pareto_front]  # 目标2: 总能耗(Wh) + 惩罚
+        ax4.scatter(obj1, obj2, c='purple', s=50, alpha=0.7)
+        ax4.set_xlabel('目标1: 总距离 + 惩罚')
+        ax4.set_ylabel('目标2: 总能耗(Wh) + 惩罚')
+        ax4.set_title('帕累托前沿（目标空间）')
         ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -760,12 +978,15 @@ if __name__ == "__main__":
     import os
     
     # 加载测试实例
-    test_file = "dataset/instances/test_small_20.dat"
+    test_file = "Order_demand_dataset/instances/test_small_20.dat"
     
     if os.path.exists(test_file):
         print("加载MTDRP问题实例...")
         instance = load_instance(test_file)
-        print_instance_info(instance)
+        print(f"实例名称: {instance.name}")
+        print(f"客户数量: {instance.num_customers}")
+        print(f"无人机数量: {instance.num_drones}")
+        print(f"配送中心: ({instance.depot.x}, {instance.depot.y})")
         
         # 使用RLTS-NSGA-II求解
         result = solve_mtdrp_rlts_nsga2(
@@ -779,16 +1000,13 @@ if __name__ == "__main__":
         )
         
         # 可视化结果
-        visualize_mtdrp_results(result, instance, "picture_result/mtdrp_rlts_nsga2")
+        visualize_mtdrp_results(result, instance, "result/mtdrp_rlts_nsga2")
         
         # 打印最优解详情
-        if result['pareto_front']:
-            print("\n最优解详情:")
-            best = min(result['pareto_front'], key=lambda x: x['cost'])
-            print(f"  总成本: {best['cost']:.2f}")
-            print(f"  总能耗: {best['energy']*1000:.2f} Wh")
-            print(f"  总距离: {best['distance']:.2f} m")
-            print(f"  行程数: {best['num_trips']}")
-    else:
-        print(f"测试文件不存在: {test_file}")
-        print("请确保dataset文件夹中有测试数据")
+        print("\n最优解详情:")
+        best = min(result['pareto_front'], key=lambda x: x['cost'])
+        print(f"  总成本: {best['cost']:.2f}")
+        print(f"  总能耗: {best['energy']*1000:.2f} Wh")
+        print(f"  总距离: {best['distance']:.2f} m")
+        print(f"  行程数: {best['num_trips']}")
+

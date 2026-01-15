@@ -21,20 +21,41 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import random
+import lightgbm as lgb
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+import pickle
+
+# 尝试导入PyTorch，如果失败则使用替代方案
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    PYTORCH_AVAILABLE = True
+except ImportError:
+    print("[WARNING] PyTorch未安装，深度学习模型将使用简化实现")
+    PYTORCH_AVAILABLE = False
+
+
+# ==================== 全局参数配置 ====================
+NUM_DRONES: int = 12  # 无人机数量
 
 
 @dataclass
 class DroneParameters:
-    """无人机物理参数"""
-    W: float = 1.5          # 机身重量 [kg]
-    m: float = 1.5          # 电池重量 [kg]
-    Q: float = 8.0          # 最大载重 [kg]
+    """无人机物理参数 - 基于UAS04028624实际参数"""
+    W: float = 36.0         # 无人机自重（含电池） [kg] - 根据实际数据
+    m: float = 0.0          # 电池重量已包含在自重中 [kg]
+    Q: float = 8.0          # 最大载重 [kg] - 保持原设定
     g: float = 9.81         # 重力加速度 [N/kg]
     rho: float = 1.204      # 空气密度 [kg/m^3]
-    xi: float = 0.0064      # 旋翼圆盘面积 [m^2]
+    xi: float = 0.3848      # 旋翼圆盘面积 [m^2] - 根据实际数据
     h: int = 6              # 旋翼数量
-    sigma: float = 0.27     # 电池能量容量 [kWh] (Set A)
-    speed: float = 10.0     # 飞行速度 [m/s] (假设值，可根据实际调整)
+    sigma: float = 1     # 电池能量容量 [kWh]
+    speed: float = 10.0     # 飞行速度 [m/s]
+    
+    # 实际无人机规格参数 (UAS04028624)
+    drone_id: str = "UAS04028624"  # 无人机ID
     
     # 计算得到的常数 k
     @property
@@ -121,89 +142,56 @@ def load_instance(filepath: str) -> MTDRPInstance:
     """
     从文件加载MTDRP问题实例
     
+    只从数据文件读取客户信息（坐标、需求、时间窗）和配送中心位置。
+    无人机参数使用 DroneParameters 类中定义的默认值。
+    无人机数量使用全局变量 NUM_DRONES。
+        
     参数:
         filepath: 数据文件路径
         
     返回:
         MTDRPInstance 对象
     """
+    # 使用预定义的无人机参数（不从文件读取）
     drone_params = DroneParameters()
     customers = []
     depot = Depot()
-    num_drones = 12
     instance_name = os.path.basename(filepath)
     
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
     
-    section = None
+    in_customer_section = False
+    
     for line in lines:
         line = line.strip()
         if not line:
             continue
-            
-        # 识别数据段
-        if line.startswith('Drone_data'):
-            section = 'drone'
-            continue
-        elif line.startswith('Battery_data'):
-            section = 'battery'
-            continue
-        elif line.startswith('Customers_data'):
-            section = 'customer'
-            continue
-        elif line.startswith('Num_drones'):
-            parts = line.split()
-            num_drones = int(parts[1])
+        
+        # 识别客户数据段
+        if line.startswith('Customers_data'):
+            in_customer_section = True
             continue
         
-        # 解析无人机参数
-        if section == 'drone':
-            parts = line.split()
-            if len(parts) >= 2:
-                param_name = parts[0]
-                try:
-                    param_value = float(parts[1])
-                except ValueError:
-                    continue
-                if param_name == 'q_d':
-                    # q_d 是总载重能力，Q 是最大有效载荷
-                    drone_params.Q = 8.0  # 最大载重 8 kg
-                elif param_name == 'W':
-                    drone_params.W = param_value
-                elif param_name == 'm':
-                    drone_params.m = param_value
-                elif param_name == 'g':
-                    drone_params.g = param_value
-                elif param_name == 'rho_d':
-                    drone_params.rho = param_value
-                elif param_name == 'xi_d':
-                    drone_params.xi = param_value
-                elif param_name == 'h_d':
-                    drone_params.h = int(param_value)
+        # 遇到其他数据段则退出客户数据解析
+        if line.endswith('_data') or line.startswith('Num_'):
+            in_customer_section = False
+            continue
         
-        # 解析电池参数
-        elif section == 'battery':
-            parts = line.split()
-            if len(parts) >= 2:
-                param_name = parts[0]
-                if param_name == 'max_energy_density':
-                    drone_params.sigma = float(parts[1])
-        
-        # 解析客户数据
-        elif section == 'customer':
+        # 只解析客户数据
+        if in_customer_section:
             if line.startswith('id'):  # 跳过表头
                 continue
             parts = line.split()
             if len(parts) >= 7:
                 cust_id = int(parts[0])
-                if cust_id == 0:  # depot
+                if cust_id == 0:  # depot (配送中心)
                     depot = Depot(
                         id=0,
                         x=float(parts[4]),
                         y=float(parts[5])
                     )
-                else:
+                else:  # 客户节点
                     customer = Customer(
                         id=cust_id,
                         x=float(parts[4]),
@@ -220,7 +208,7 @@ def load_instance(filepath: str) -> MTDRPInstance:
         depot=depot,
         customers=customers,
         drone_params=drone_params,
-        num_drones=num_drones
+        num_drones=NUM_DRONES
     )
 
 
@@ -257,23 +245,32 @@ class NonlinearEnergyModel:
         total_weight = self.params.W + self.params.m + payload
         return self.k * (total_weight ** 1.5)
     
-    def energy_consumption(self, payload: float, distance: float) -> float:
+    def energy_consumption(self, payload: float, end_time: float, start_time: float) -> float:
         """
         计算飞行能量消耗 [kWh]
         
-        E = P(q) * t = P(q) * (d / v)
+        使用精准公式: E = t * (v + q)^1.5 * sqrt(g^3 / (2 * rho * z * n))
+        其中 t = end_time - start_time
         
         参数:
             payload: 载重 [kg]
-            distance: 飞行距离 [m]
+            end_time: 结束时间 [s]
+            start_time: 开始时间 [s]
             
         返回:
             能量消耗 [kWh]
         """
-        power_w = self.power(payload)
-        travel_time_s = distance / self.params.speed  # 秒
-        energy_j = power_w * travel_time_s  # 焦耳
-        energy_kwh = energy_j / 3600000.0  # 转换为 kWh
+        # 获取飞行时长和载荷
+        t = end_time - start_time  # 实际飞行时间
+        q = payload
+        
+        # 计算能耗 (J): e = t * (W + q)^1.5 * sqrt(g^3 / (2 * rho * xi * h))
+        # 使用DroneParameters中已定义的参数和常数k
+        energy_j = t * ((self.params.W + q) ** 1.5) * self.k
+        
+        # 转换为 kWh (1 kWh = 3,600,000 J)
+        energy_kwh = energy_j / 3600000
+        
         return energy_kwh
     
     def energy_consumption_for_arc(self, payload: float, travel_time_min: float) -> float:
@@ -310,283 +307,672 @@ class NonlinearEnergyModel:
         return max_distance
 
 
-class MTDRPSolution:
+class TreeBasedEnergyModel:
     """
-    MTDRP解的表示
+    基于LightGBM树模型的能量消耗模型
     
-    一个解包含多架无人机的多个行程
-    每个行程是一个客户访问序列
-    """
-    
-    def __init__(self, instance: MTDRPInstance):
-        self.instance = instance
-        # routes[drone_id] = [trip1, trip2, ...] 
-        # 每个trip是客户ID列表 (不包含depot)
-        self.routes: Dict[int, List[List[int]]] = {k: [] for k in range(instance.num_drones)}
-        
-    def add_trip(self, drone_id: int, customers: List[int]):
-        """为无人机添加一个行程"""
-        if customers:
-            self.routes[drone_id].append(customers)
-    
-    def get_all_trips(self) -> List[Tuple[int, int, List[int]]]:
-        """获取所有行程 [(drone_id, trip_idx, customers), ...]"""
-        trips = []
-        for drone_id, drone_trips in self.routes.items():
-            for trip_idx, customers in enumerate(drone_trips):
-                trips.append((drone_id, trip_idx, customers))
-        return trips
-    
-    def get_visited_customers(self) -> set:
-        """获取所有被访问的客户"""
-        visited = set()
-        for drone_trips in self.routes.values():
-            for trip in drone_trips:
-                visited.update(trip)
-        return visited
-    
-    def is_complete(self) -> bool:
-        """检查是否所有客户都被访问"""
-        visited = self.get_visited_customers()
-        required = set(c.id for c in self.instance.customers)
-        return visited == required
-
-
-class MTDRPEvaluator:
-    """
-    MTDRP解的评估器
-    
-    计算目标函数值和约束违反情况
+    该模型使用训练好的LightGBM模型来预测无人机的能耗，
+    提供与NonlinearEnergyModel相同的接口以便于替换。
     """
     
-    def __init__(self, instance: MTDRPInstance):
-        self.instance = instance
-        self.energy_model = NonlinearEnergyModel(instance.drone_params)
-        
-        # 创建客户ID到索引的映射
-        self.customer_map = {c.id: c for c in instance.customers}
-        
-    def evaluate(self, solution: MTDRPSolution) -> Tuple[float, float, Dict]:
+    def __init__(self, model_path: str = 'result/drone_energy_lgb_model.txt',
+                 wind_speed: float = 5.0, wind_angle: float = 90.0,
+                 temperature: float = 25.0, humidity: float = 60.0):
         """
-        评估解的质量
+        初始化树模型能耗预测器
         
+        参数:
+            model_path: 训练好的LightGBM模型文件路径
+            wind_speed: 默认风速 [m/s]
+            wind_angle: 默认风向夹角 [度]
+            temperature: 默认温度 [°C]
+            humidity: 默认湿度 [%]
+            
+        注意: 载重(payload)和距离(distance)在调用预测方法时提供
+        """
+        self.model_path = model_path
+        self.model = None
+        
+        # 环境参数
+        self.default_wind_speed = wind_speed
+        self.default_wind_angle = wind_angle
+        self.default_temperature = temperature
+        self.default_humidity = humidity
+        
+        self._load_model()
+    
+    def _load_model(self):
+        """加载训练好的LightGBM模型"""
+        try:
+            if os.path.exists(self.model_path):
+                self.model = lgb.Booster(model_file=self.model_path)
+            else:
+                print(f"警告: 模型文件不存在 {self.model_path}")
+                self.model = None
+        except Exception as e:
+            print(f"加载模型失败: {e}")
+            self.model = None
+    
+    def _predict_energy_consumption(self, distance: float, payload: float, 
+                                   wind_speed: float = None, wind_angle: float = None,
+                                   temperature: float = None, humidity: float = None) -> float:
+        """
+        使用树模型预测能耗
+        
+        参数:
+            distance: 飞行距离 [m]
+            payload: 载重 [kg]
+            wind_speed: 风速 [m/s]
+            wind_angle: 风向夹角 [度]
+            temperature: 温度 [°C]
+            humidity: 湿度 [%]
+            
         返回:
-            (total_cost, total_penalty, details)
-            - total_cost: 总成本 (目标函数值)
-            - total_penalty: 约束违反惩罚
-            - details: 详细信息字典
+            能量消耗 [kWh]
         """
-        total_energy = 0.0
-        total_distance = 0.0
-        total_delay = 0.0
-        penalties = {
-            'unvisited': 0.0,
-            'capacity': 0.0,
-            'energy': 0.0,
-            'time_window': 0.0,
-            'duplicate': 0.0
-        }
+        if self.model is None:
+            raise ValueError("模型未加载，无法进行预测")
         
-        visited_customers = set()
+        # 使用默认值填充缺失的环境参数
+        wind_speed = wind_speed if wind_speed is not None else self.default_wind_speed
+        wind_angle = wind_angle if wind_angle is not None else self.default_wind_angle
+        temperature = temperature if temperature is not None else self.default_temperature
+        humidity = humidity if humidity is not None else self.default_humidity
         
-        # 评估每架无人机的每个行程
-        for drone_id, drone_trips in solution.routes.items():
-            for trip in drone_trips:
-                trip_result = self._evaluate_trip(trip, visited_customers)
-                total_energy += trip_result['energy']
-                total_distance += trip_result['distance']
-                total_delay += trip_result['delay']
-                
-                for key in penalties:
-                    penalties[key] += trip_result['penalties'].get(key, 0.0)
-                
-                visited_customers.update(trip)
+        # 准备特征向量 [distance, payload, wind_speed, wind_angle, temperature, humidity]
+        features = np.array([[distance, payload, wind_speed, wind_angle, temperature, humidity]])
         
-        # 检查未访问的客户
-        required = set(c.id for c in self.instance.customers)
-        unvisited = required - visited_customers
-        penalties['unvisited'] = len(unvisited) * 10000.0  # 大惩罚
-        
-        total_penalty = sum(penalties.values())
-        
-        # 目标函数: min Σ(c_ij * x_ij + δ * e_ij)
-        # 这里 c_ij 可以是距离成本，δ 是能量成本系数
-        delta = 1.0  # 能量成本系数
-        total_cost = total_distance + delta * total_energy * 1000  # 能量转换为合适的单位
-        
-        details = {
-            'total_energy': total_energy,
-            'total_distance': total_distance,
-            'total_delay': total_delay,
-            'penalties': penalties,
-            'num_trips': sum(len(trips) for trips in solution.routes.values()),
-            'visited_customers': len(visited_customers),
-            'unvisited_customers': len(unvisited)
-        }
-        
-        return total_cost, total_penalty, details
+        try:
+            # 使用模型预测
+            energy_kwh = self.model.predict(features)[0]
+            return max(0.0, energy_kwh)  # 确保能耗非负
+        except Exception as e:
+            raise ValueError(f"树模型预测失败: {e}")
     
-    def _evaluate_trip(self, trip: List[int], already_visited: set) -> Dict:
-        """评估单个行程"""
-        result = {
-            'energy': 0.0,
-            'distance': 0.0,
-            'delay': 0.0,
-            'penalties': {}
-        }
+    def power(self, payload: float, speed: float = 10.0) -> float:
+        """
+        计算给定载重下的悬停功率 [W]
         
-        if not trip:
-            return result
+        注意: 树模型直接预测能耗，此方法通过估算得到功率
         
-        # 检查重复访问
-        for cust_id in trip:
-            if cust_id in already_visited:
-                result['penalties']['duplicate'] = result['penalties'].get('duplicate', 0) + 5000.0
-        
-        # 计算行程的载重、能量、时间
-        # 从depot出发，访问所有客户，返回depot
-        
-        # 计算初始载重 (所有客户需求之和)
-        total_demand = sum(self.customer_map[cid].demand for cid in trip if cid in self.customer_map)
-        
-        # 检查载重约束
-        if total_demand > self.instance.drone_params.Q:
-            result['penalties']['capacity'] = (total_demand - self.instance.drone_params.Q) * 1000.0
-        
-        # 模拟行程
-        current_node = 0  # depot
-        current_time = 0.0
-        current_payload = total_demand
-        trip_energy = 0.0
-        trip_distance = 0.0
-        
-        for cust_id in trip:
-            if cust_id not in self.customer_map:
-                continue
-                
-            customer = self.customer_map[cust_id]
-            cust_idx = cust_id  # 客户在矩阵中的索引
+        参数:
+            payload: 载重 [kg]
+            speed: 飞行速度 [m/s]，默认10.0
             
-            # 计算到客户的距离和时间
-            dist = self.instance.distance_matrix[current_node, cust_idx]
-            travel_time = self.instance.travel_time_matrix[current_node, cust_idx]
+        返回:
+            功率 [W]
+        """
+        # 使用标准距离（1000m）和时间来估算功率
+        standard_distance = 1000.0  # 1km
+        travel_time_s = standard_distance / speed
+        energy_kwh = self._predict_energy_consumption(standard_distance, payload)
+        energy_j = energy_kwh * 3600000.0  # 转换为焦耳
+        power_w = energy_j / travel_time_s
+        return power_w
+    
+    def energy_consumption(self, payload: float, distance: float) -> float:
+        """
+        计算飞行能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            distance: 飞行距离 [m]
             
-            # 计算能量消耗
-            energy = self.energy_model.energy_consumption(current_payload, dist)
-            trip_energy += energy
-            trip_distance += dist
+        返回:
+            能量消耗 [kWh]
+        """
+        return self._predict_energy_consumption(distance, payload)
+    
+    def energy_consumption_for_arc(self, payload: float, travel_time_min: float, speed: float = 10.0) -> float:
+        """
+        计算弧上的能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            travel_time_min: 旅行时间 [分钟]
+            speed: 飞行速度 [m/s]，默认10.0
             
-            # 更新时间
-            arrival_time = current_time + travel_time
+        返回:
+            能量消耗 [kWh]
+        """
+        # 根据时间和速度计算距离
+        distance = (travel_time_min * 60.0) * speed  # 转换为米
+        return self._predict_energy_consumption(distance, payload)
+    
+    def max_range_with_payload(self, payload: float, max_energy_kwh: float = 0.27) -> float:
+        """
+        计算给定载重下的最大飞行距离 [m]
+        
+        参数:
+            payload: 载重 [kg]
+            max_energy_kwh: 最大电池容量 [kWh]，默认0.27
             
-            # 检查时间窗约束
-            if arrival_time < customer.earliest_time:
-                # 等待到最早服务时间
-                current_time = customer.earliest_time + customer.service_time
-            elif arrival_time > customer.latest_time:
-                # 违反时间窗
-                delay = arrival_time - customer.latest_time
-                result['delay'] += delay
-                result['penalties']['time_window'] = result['penalties'].get('time_window', 0) + delay * 100.0
-                current_time = arrival_time + customer.service_time
+        返回:
+            最大飞行距离 [m]
+        """
+        # 使用二分搜索找到最大飞行距离
+        min_distance = 0.0
+        max_distance = 50000.0  # 50km作为上限
+        tolerance = 10.0  # 10m精度
+        
+        while max_distance - min_distance > tolerance:
+            mid_distance = (min_distance + max_distance) / 2.0
+            predicted_energy = self._predict_energy_consumption(mid_distance, payload)
+            
+            if predicted_energy <= max_energy_kwh:
+                min_distance = mid_distance
             else:
-                current_time = arrival_time + customer.service_time
-            
-            # 卸货后更新载重
-            current_payload -= customer.demand
-            current_node = cust_idx
+                max_distance = mid_distance
         
-        # 返回depot
-        dist_to_depot = self.instance.distance_matrix[current_node, 0]
-        energy_to_depot = self.energy_model.energy_consumption(current_payload, dist_to_depot)
-        trip_energy += energy_to_depot
-        trip_distance += dist_to_depot
-        
-        # 检查电池能量约束
-        if trip_energy > self.instance.drone_params.sigma:
-            result['penalties']['energy'] = (trip_energy - self.instance.drone_params.sigma) * 10000.0
-        
-        result['energy'] = trip_energy
-        result['distance'] = trip_distance
-        
-        return result
-
-
-def print_instance_info(instance: MTDRPInstance):
-    """打印问题实例信息"""
-    print(f"\n{'='*60}")
-    print(f"MTDRP 问题实例: {instance.name}")
-    print(f"{'='*60}")
-    print(f"配送中心位置: ({instance.depot.x}, {instance.depot.y})")
-    print(f"客户数量: {instance.num_customers}")
-    print(f"无人机数量: {instance.num_drones}")
-    print(f"\n无人机参数:")
-    print(f"  机身重量 W: {instance.drone_params.W} kg")
-    print(f"  电池重量 m: {instance.drone_params.m} kg")
-    print(f"  最大载重 Q: {instance.drone_params.Q} kg")
-    print(f"  电池容量 σ: {instance.drone_params.sigma} kWh")
-    print(f"  能量常数 k: {instance.drone_params.k:.4f}")
-    print(f"\n客户需求统计:")
-    demands = [c.demand for c in instance.customers]
-    print(f"  最小需求: {min(demands):.2f} kg")
-    print(f"  最大需求: {max(demands):.2f} kg")
-    print(f"  平均需求: {np.mean(demands):.2f} kg")
-    print(f"  总需求: {sum(demands):.2f} kg")
+        return min_distance
     
-    # 计算能量模型示例
-    energy_model = NonlinearEnergyModel(instance.drone_params)
-    print(f"\n能量消耗示例 (飞行1km):")
-    for payload in [0.0, 0.5, 1.0, 1.5]:
-        energy = energy_model.energy_consumption(payload, 1000.0)
-        print(f"  载重 {payload} kg: {energy*1000:.4f} Wh")
+    def set_environmental_conditions(self, wind_speed: float = None, wind_angle: float = None,
+                                   temperature: float = None, humidity: float = None):
+        """
+        设置环境条件的默认值
+        
+        参数:
+            wind_speed: 风速 [m/s]
+            wind_angle: 风向夹角 [度]
+            temperature: 温度 [°C]
+            humidity: 湿度 [%]
+        """
+        if wind_speed is not None:
+            self.default_wind_speed = wind_speed
+        if wind_angle is not None:
+            self.default_wind_angle = wind_angle
+        if temperature is not None:
+            self.default_temperature = temperature
+        if humidity is not None:
+            self.default_humidity = humidity
 
 
-# 测试代码
-if __name__ == "__main__":
-    # 加载测试实例
-    test_file = "dataset/instances/200/bccl1_ud_m200.dat"
+class LinearRegressionEnergyModel:
+    """
+    基于距离和载荷的线性回归能耗模型
     
-    if os.path.exists(test_file):
-        instance = load_instance(test_file)
-        print_instance_info(instance)
+    该模型仅使用距离和载荷两个特征进行线性回归预测，
+    用于验证考虑气象因素的必要性。
+    """
+    
+    def __init__(self, model_path: str = 'result/linear_regression_model.pkl'):
+        """
+        初始化线性回归能耗预测器
         
-        # 创建一个简单的测试解
-        solution = MTDRPSolution(instance)
-        
-        # 简单贪心: 按时间窗排序，依次分配给无人机
-        sorted_customers = sorted(instance.customers, key=lambda c: c.earliest_time)
-        
-        current_drone = 0
-        current_trip = []
-        current_load = 0.0
-        
-        for customer in sorted_customers[:20]:  # 只测试前20个客户
-            if current_load + customer.demand <= instance.drone_params.Q:
-                current_trip.append(customer.id)
-                current_load += customer.demand
+        参数:
+            model_path: 训练好的线性回归模型文件路径
+        """
+        self.model_path = model_path
+        self.model = None
+        self.scaler = None
+        self._load_model()
+    
+    def _load_model(self):
+        """加载训练好的线性回归模型"""
+        try:
+            if os.path.exists(self.model_path):
+                with open(self.model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                    self.model = model_data['model']
+                    self.scaler = model_data['scaler']
+                print(f"[OK] 线性回归模型加载成功: {self.model_path}")
             else:
-                if current_trip:
-                    solution.add_trip(current_drone, current_trip)
-                current_drone = (current_drone + 1) % instance.num_drones
-                current_trip = [customer.id]
-                current_load = customer.demand
+                print(f"[WARNING] 模型文件不存在: {self.model_path}")
+                print("[INFO] 将使用默认线性回归模型")
+                self._create_default_model()
+        except Exception as e:
+            print(f"[ERROR] 加载线性回归模型失败: {e}")
+            print("[INFO] 将使用默认线性回归模型")
+            self._create_default_model()
+    
+    def _create_default_model(self):
+        """创建默认的线性回归模型（基于经验参数）"""
+        self.model = LinearRegression()
+        self.scaler = StandardScaler()
         
-        if current_trip:
-            solution.add_trip(current_drone, current_trip)
+        # 基于物理模型的经验参数设置默认权重
+        # E ≈ α * distance + β * payload + γ
+        # 其中α、β、γ是根据物理模型估算的经验参数
+        self.model.coef_ = np.array([0.00005, 0.01])  # [distance_coef, payload_coef]
+        self.model.intercept_ = 0.05  # 基础能耗
         
-        # 评估解
-        evaluator = MTDRPEvaluator(instance)
-        cost, penalty, details = evaluator.evaluate(solution)
+        # 设置标准化器的参数（基于典型数据范围）
+        self.scaler.mean_ = np.array([2500.0, 4.0])  # [distance_mean, payload_mean]
+        self.scaler.scale_ = np.array([2000.0, 3.0])  # [distance_std, payload_std]
         
-        print(f"\n{'='*60}")
-        print("测试解评估结果:")
-        print(f"{'='*60}")
-        print(f"总成本: {cost:.2f}")
-        print(f"总惩罚: {penalty:.2f}")
-        print(f"总能耗: {details['total_energy']*1000:.2f} Wh")
-        print(f"总距离: {details['total_distance']:.2f} m")
-        print(f"行程数: {details['num_trips']}")
-        print(f"已访问客户: {details['visited_customers']}")
-        print(f"未访问客户: {details['unvisited_customers']}")
+        print("[INFO] 使用默认线性回归参数")
+    
+    def _predict_energy_consumption(self, distance: float, payload: float) -> float:
+        """
+        使用线性回归模型预测能耗
+        
+        参数:
+            distance: 飞行距离 [m]
+            payload: 载重 [kg]
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        if self.model is None:
+            raise ValueError("线性回归模型未加载，无法进行预测")
+        
+        # 准备特征向量 [distance, payload]
+        features = np.array([[distance, payload]])
+        
+        try:
+            # 标准化特征
+            if self.scaler is not None:
+                features_scaled = self.scaler.transform(features)
+            else:
+                features_scaled = features
+            
+            # 使用模型预测
+            energy_kwh = self.model.predict(features_scaled)[0]
+            return max(0.0, energy_kwh)  # 确保能耗非负
+        except Exception as e:
+            raise ValueError(f"线性回归模型预测失败: {e}")
+    
+    def power(self, payload: float, speed: float = 10.0) -> float:
+        """
+        计算给定载重下的悬停功率 [W]
+        
+        参数:
+            payload: 载重 [kg]
+            speed: 飞行速度 [m/s]，默认10.0
+            
+        返回:
+            功率 [W]
+        """
+        # 使用标准距离（1000m）和时间来估算功率
+        standard_distance = 1000.0  # 1km
+        travel_time_s = standard_distance / speed
+        energy_kwh = self._predict_energy_consumption(standard_distance, payload)
+        energy_j = energy_kwh * 3600000.0  # 转换为焦耳
+        power_w = energy_j / travel_time_s
+        return power_w
+    
+    def energy_consumption(self, payload: float, distance: float) -> float:
+        """
+        计算飞行能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            distance: 飞行距离 [m]
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        return self._predict_energy_consumption(distance, payload)
+    
+    def energy_consumption_for_arc(self, payload: float, travel_time_min: float, speed: float = 10.0) -> float:
+        """
+        计算弧上的能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            travel_time_min: 旅行时间 [分钟]
+            speed: 飞行速度 [m/s]，默认10.0
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        # 根据时间和速度计算距离
+        distance = (travel_time_min * 60.0) * speed  # 转换为米
+        return self._predict_energy_consumption(distance, payload)
+    
+    def max_range_with_payload(self, payload: float, max_energy_kwh: float = 0.27) -> float:
+        """
+        计算给定载重下的最大飞行距离 [m]
+        
+        参数:
+            payload: 载重 [kg]
+            max_energy_kwh: 最大电池容量 [kWh]，默认0.27
+            
+        返回:
+            最大飞行距离 [m]
+        """
+        # 使用线性关系直接计算
+        if self.model is None:
+            return 10000.0  # 默认值
+        
+        try:
+            # 对于线性模型: E = α * distance + β * payload + γ
+            # 解出: distance = (E - β * payload - γ) / α
+            coef_distance = self.model.coef_[0] if len(self.model.coef_) > 0 else 0.00005
+            coef_payload = self.model.coef_[1] if len(self.model.coef_) > 1 else 0.01
+            intercept = self.model.intercept_
+            
+            # 考虑标准化的影响
+            if self.scaler is not None:
+                # 反向计算原始特征空间的系数
+                coef_distance = coef_distance / self.scaler.scale_[0]
+                coef_payload = coef_payload / self.scaler.scale_[1]
+                intercept = intercept + np.dot(self.model.coef_, self.scaler.mean_ / self.scaler.scale_)
+            
+            if coef_distance > 0:
+                max_distance = (max_energy_kwh - coef_payload * payload - intercept) / coef_distance
+                return max(0.0, max_distance)
+            else:
+                return 50000.0  # 如果系数异常，返回一个大值
+        except Exception as e:
+            print(f"[WARNING] 计算最大航程失败: {e}")
+            return 10000.0
+
+
+# PyTorch深度学习模型网络结构
+if PYTORCH_AVAILABLE:
+    class EnergyNet(nn.Module):
+        """
+        基于PyTorch的能耗预测神经网络
+        """
+        def __init__(self, input_size=6, hidden_sizes=[32, 16], dropout_rate=0.1):
+            super(EnergyNet, self).__init__()
+            
+            layers = []
+            prev_size = input_size
+            
+            # 隐藏层 - 简化为2层
+            for i, hidden_size in enumerate(hidden_sizes):
+                layers.append(nn.Linear(prev_size, hidden_size))
+                layers.append(nn.ReLU())
+                # 只在第一层使用dropout，减少正则化强度
+                if i == 0:
+                    layers.append(nn.Dropout(dropout_rate))
+                prev_size = hidden_size
+            
+            # 输出层
+            layers.append(nn.Linear(prev_size, 1))
+            layers.append(nn.ReLU())  # 确保输出非负
+            
+            self.network = nn.Sequential(*layers)
+            
+            # 权重初始化
+            self._initialize_weights()
+        
+        def _initialize_weights(self):
+            """初始化网络权重"""
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+        
+        def forward(self, x):
+            return self.network(x)
+
+
+class DeepLearningEnergyModel:
+    """
+    基于PyTorch深度学习的能耗模型
+    
+    使用全连接神经网络预测无人机能耗，
+    输入特征包括距离、载荷、风速、风向夹角、温度、湿度。
+    """
+    
+    def __init__(self, model_path: str = 'result/pytorch_energy_model.pth',
+                 wind_speed: float = 5.0, wind_angle: float = 90.0,
+                 temperature: float = 25.0, humidity: float = 60.0):
+        """
+        初始化深度学习能耗预测器
+        
+        参数:
+            model_path: 训练好的PyTorch模型文件路径
+            wind_speed: 默认风速 [m/s]
+            wind_angle: 默认风向夹角 [度]
+            temperature: 默认温度 [°C]
+            humidity: 默认湿度 [%]
+        """
+        self.model_path = model_path
+        self.model = None
+        self.scaler = None
+        
+        # 环境参数
+        self.default_wind_speed = wind_speed
+        self.default_wind_angle = wind_angle
+        self.default_temperature = temperature
+        self.default_humidity = humidity
+        
+        self._load_model()
+    
+    def _load_model(self):
+        """加载训练好的PyTorch模型"""
+        try:
+            if PYTORCH_AVAILABLE and os.path.exists(self.model_path):
+                self.model = EnergyNet()
+                self.model.load_state_dict(torch.load(self.model_path, map_location='cpu'))
+                self.model.eval()
+                print(f"[OK] PyTorch深度学习模型加载成功: {self.model_path}")
+                
+                # 尝试加载标准化器
+                scaler_path = self.model_path.replace('.pth', '_scaler.pkl')
+                if os.path.exists(scaler_path):
+                    with open(scaler_path, 'rb') as f:
+                        self.scaler = pickle.load(f)
+                    print(f"[OK] 标准化器加载成功: {scaler_path}")
+            else:
+                if not PYTORCH_AVAILABLE:
+                    print("[WARNING] PyTorch未安装，将创建简化深度学习模型")
+                else:
+                    print(f"[WARNING] 模型文件不存在: {self.model_path}")
+                print("[INFO] 将创建默认深度学习模型")
+                self._create_default_model()
+        except Exception as e:
+            print(f"[ERROR] 加载PyTorch深度学习模型失败: {e}")
+            print("[INFO] 将创建默认深度学习模型")
+            self._create_default_model()
+    
+    def _create_default_model(self):
+        """创建默认的深度学习模型"""
+        try:
+            if PYTORCH_AVAILABLE:
+                self.model = EnergyNet()
+                self.model.eval()
+                print("[INFO] 创建默认PyTorch深度学习模型")
+            else:
+                # 使用简化的模拟模型
+                self.model = None
+                print("[INFO] 创建简化深度学习模型（无PyTorch）")
+            
+            # 创建默认标准化器
+            self.scaler = StandardScaler()
+            self.scaler.mean_ = np.array([2500.0, 4.0, 5.0, 90.0, 25.0, 60.0])
+            self.scaler.scale_ = np.array([2000.0, 3.0, 3.0, 45.0, 10.0, 20.0])
+            
+        except Exception as e:
+            print(f"[ERROR] 创建默认深度学习模型失败: {e}")
+            self.model = None
+    
+    def _predict_energy_consumption(self, distance: float, payload: float,
+                                   wind_speed: float = None, wind_angle: float = None,
+                                   temperature: float = None, humidity: float = None) -> float:
+        """
+        使用深度学习模型预测能耗
+        
+        参数:
+            distance: 飞行距离 [m]
+            payload: 载重 [kg]
+            wind_speed: 风速 [m/s]
+            wind_angle: 风向夹角 [度]
+            temperature: 温度 [°C]
+            humidity: 湿度 [%]
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        # 使用默认值填充缺失的环境参数
+        wind_speed = wind_speed if wind_speed is not None else self.default_wind_speed
+        wind_angle = wind_angle if wind_angle is not None else self.default_wind_angle
+        temperature = temperature if temperature is not None else self.default_temperature
+        humidity = humidity if humidity is not None else self.default_humidity
+        
+        # 准备特征向量 [distance, payload, wind_speed, wind_angle, temperature, humidity]
+        features = np.array([[distance, payload, wind_speed, wind_angle, temperature, humidity]])
+        
+        try:
+            if PYTORCH_AVAILABLE and self.model is not None:
+                # 标准化特征
+                if self.scaler is not None:
+                    features_scaled = self.scaler.transform(features)
+                else:
+                    features_scaled = features
+                
+                # 转换为PyTorch张量
+                input_tensor = torch.FloatTensor(features_scaled)
+                
+                # 使用模型预测
+                with torch.no_grad():
+                    energy_kwh = self.model(input_tensor).item()
+                
+                return max(0.0, energy_kwh)  # 确保能耗非负
+            else:
+                # 简化的预测逻辑（无PyTorch时）
+                energy = 0.00005 * distance + 0.01 * payload + 0.05
+                return max(0.0, energy)
+                
+        except Exception as e:
+            raise ValueError(f"深度学习模型预测失败: {e}")
+    
+    def power(self, payload: float, speed: float = 10.0) -> float:
+        """
+        计算给定载重下的悬停功率 [W]
+        
+        参数:
+            payload: 载重 [kg]
+            speed: 飞行速度 [m/s]，默认10.0
+            
+        返回:
+            功率 [W]
+        """
+        # 使用标准距离（1000m）和时间来估算功率
+        standard_distance = 1000.0  # 1km
+        travel_time_s = standard_distance / speed
+        energy_kwh = self._predict_energy_consumption(standard_distance, payload)
+        energy_j = energy_kwh * 3600000.0  # 转换为焦耳
+        power_w = energy_j / travel_time_s
+        return power_w
+    
+    def energy_consumption(self, payload: float, distance: float) -> float:
+        """
+        计算飞行能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            distance: 飞行距离 [m]
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        return self._predict_energy_consumption(distance, payload)
+    
+    def energy_consumption_for_arc(self, payload: float, travel_time_min: float, speed: float = 10.0) -> float:
+        """
+        计算弧上的能量消耗 [kWh]
+        
+        参数:
+            payload: 载重 [kg]
+            travel_time_min: 旅行时间 [分钟]
+            speed: 飞行速度 [m/s]，默认10.0
+            
+        返回:
+            能量消耗 [kWh]
+        """
+        # 根据时间和速度计算距离
+        distance = (travel_time_min * 60.0) * speed  # 转换为米
+        return self._predict_energy_consumption(distance, payload)
+    
+    def max_range_with_payload(self, payload: float, max_energy_kwh: float = 0.27) -> float:
+        """
+        计算给定载重下的最大飞行距离 [m]
+        
+        参数:
+            payload: 载重 [kg]
+            max_energy_kwh: 最大电池容量 [kWh]，默认0.27
+            
+        返回:
+            最大飞行距离 [m]
+        """
+        # 使用二分搜索找到最大飞行距离
+        min_distance = 0.0
+        max_distance = 50000.0  # 50km作为上限
+        tolerance = 10.0  # 10m精度
+        
+        while max_distance - min_distance > tolerance:
+            mid_distance = (min_distance + max_distance) / 2.0
+            predicted_energy = self._predict_energy_consumption(mid_distance, payload)
+            
+            if predicted_energy <= max_energy_kwh:
+                min_distance = mid_distance
+            else:
+                max_distance = mid_distance
+        
+        return min_distance
+    
+    def set_environmental_conditions(self, wind_speed: float = None, wind_angle: float = None,
+                                   temperature: float = None, humidity: float = None):
+        """
+        设置环境条件的默认值
+        
+        参数:
+            wind_speed: 风速 [m/s]
+            wind_angle: 风向夹角 [度]
+            temperature: 温度 [°C]
+            humidity: 湿度 [%]
+        """
+        if wind_speed is not None:
+            self.default_wind_speed = wind_speed
+        if wind_angle is not None:
+            self.default_wind_angle = wind_angle
+        if temperature is not None:
+            self.default_temperature = temperature
+        if humidity is not None:
+            self.default_humidity = humidity
+
+
+def create_energy_model(model_type: str = "tree", instance: 'MTDRPInstance' = None):
+    """
+    创建能耗模型的工厂函数
+    
+    参数:
+        model_type: 模型类型 ("physical", "linear", "tree", "deep")
+        instance: MTDRP问题实例（用于物理模型）
+        
+    返回:
+        能耗模型实例
+    """
+    if model_type.lower() in ["physical", "nonlinear"]:  # 兼容旧的"nonlinear"标识
+        if instance is None:
+            raise ValueError("Physical Model需要MTDRPInstance参数")
+        print("[OK] 使用Physical Model (基于物理公式的非线性模型)")
+        return NonlinearEnergyModel(instance.drone_params)
+    
+    elif model_type.lower() == "linear":
+        try:
+            model = LinearRegressionEnergyModel()
+            print("[OK] 使用LinearRegressionEnergyModel (基于距离和载荷的线性回归)")
+            return model
+        except Exception as e:
+            print(f"[ERROR] LinearRegressionEnergyModel创建失败: {e}")
+            raise
+    
+    elif model_type.lower() == "tree":
+        try:
+            model = TreeBasedEnergyModel()
+            print("[OK] 使用TreeBasedEnergyModel (基于LightGBM的树模型)")
+            return model
+        except Exception as e:
+            print(f"[ERROR] TreeBasedEnergyModel创建失败: {e}")
+            raise
+    
+    elif model_type.lower() == "deep":
+        try:
+            model = DeepLearningEnergyModel()
+            print("[OK] 使用DeepLearningEnergyModel (基于PyTorch的深度学习模型)")
+            return model
+        except Exception as e:
+            print(f"[ERROR] DeepLearningEnergyModel创建失败: {e}")
+            raise
+    
     else:
-        print(f"测试文件不存在: {test_file}")
+        raise ValueError(f"不支持的模型类型: {model_type}. 支持的类型: 'physical', 'linear', 'tree', 'deep'")
+
+
