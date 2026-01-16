@@ -10,11 +10,23 @@
 2. 集成反应式禁忌搜索(RLTS)进行局部搜索
 3. 支持Q-Learning自适应参数调整
 4. 多目标优化: 最小化总距离和总能耗
+5. 基于瞬时功率预测的能耗计算
 
-能耗模型切换说明:
-- 修改第37行的 USE_TREE_MODEL 变量来切换能耗模型
-- True: 使用TreeBasedEnergyModel (基于LightGBM的机器学习模型)
-- False: 使用NonlinearEnergyModel (基于物理公式的理论模型)
+功率模型切换说明:
+- 修改第44行的 POWER_MODEL_TYPE 变量来切换功率模型
+- "physical": 基于物理公式的理论模型
+- "tree": 基于LightGBM的机器学习模型 (推荐，R²=0.83)
+- "deep": 基于PyTorch的深度学习模型
+- "linear": 基于线性回归的模型
+
+功率模型输入特征:
+- height: 高度 [m]
+- VS: 竖直速度 [m/s]
+- GS: 地速 [m/s]
+- wind_speed: 风速 [m/s]
+- temperature: 温度 [°C]
+- humidity: 湿度 [%]
+- wind_angle: 风向夹角 [度]
 
 """
 
@@ -31,36 +43,42 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from mtdrp_energy_model import (
-    MTDRPInstance, NonlinearEnergyModel, TreeBasedEnergyModel, load_instance,
-    Customer, DroneParameters
+    MTDRPInstance, load_instance, Customer, DroneParameters,
+    create_power_model, PhysicalPowerModel, TreePowerModel, 
+    DeepPowerModel, LinearPowerModel, estimate_flight_energy
 )
 
 
-# ==================== 能耗模型配置 ====================
+# ==================== 功率模型配置 ====================
 
-# 能耗模型选择配置
-# 支持的模型类型: "physical", "linear", "tree", "deep"
-ENERGY_MODEL_TYPE = "deep"  
+# 功率模型选择配置
+# 支持的模型类型: "physical", "tree", "deep", "linear"
+POWER_MODEL_TYPE = "tree"  
+
+# 默认环境参数 (用于能耗估算)
+DEFAULT_HEIGHT = 120.0      # 默认飞行高度 [m]
+DEFAULT_WIND_SPEED = 2.0    # 默认风速 [m/s]
+DEFAULT_TEMPERATURE = 25.0  # 默认温度 [°C]
+DEFAULT_HUMIDITY = 60.0     # 默认湿度 [%]
+DEFAULT_WIND_ANGLE = 90.0   # 默认风向夹角 [度]
 
 def create_energy_model(instance: MTDRPInstance):
     """
-    创建能耗模型的工厂函数
+    创建功率预测模型的工厂函数
     
     参数:
         instance: MTDRP问题实例
         
     返回:
-        能耗模型实例
+        功率预测模型实例
     """
-    from mtdrp_energy_model import create_energy_model as create_model
-    
     try:
-        model = create_model(ENERGY_MODEL_TYPE, instance)
+        model = create_power_model(POWER_MODEL_TYPE, instance)
         return model
     except Exception as e:
-        print(f"[ERROR] 创建{ENERGY_MODEL_TYPE}模型失败: {e}")
-        print("[INFO] 自动切换到NonlinearEnergyModel作为后备")
-        return NonlinearEnergyModel(instance.drone_params)
+        print(f"[ERROR] 创建{POWER_MODEL_TYPE}模型失败: {e}")
+        print("[INFO] 自动切换到PhysicalPowerModel作为后备")
+        return PhysicalPowerModel(instance.drone_params)
 
 
 # ==================== 解的表示与评估 ====================
@@ -195,14 +213,22 @@ class MTDRPEvaluator:
             dist = self.instance.distance_matrix[current_node, cust_idx]
             travel_time = self.instance.travel_time_matrix[current_node, cust_idx]
             
-            # 计算能量消耗（使用当前载重）
-            if hasattr(self.energy_model, 'energy_consumption') and len(self.energy_model.energy_consumption.__code__.co_varnames) > 3:
-                # 物理模型需要 end_time 和 start_time 参数
-                flight_time = travel_time * 60  # 转换为秒
-                energy = self.energy_model.energy_consumption(current_payload, current_time + flight_time, current_time)
-            else:
-                # 其他模型使用标准接口
-                energy = self.energy_model.energy_consumption(current_payload, dist)
+            # 计算能量消耗（使用瞬时功率模型）
+            flight_time_seconds = travel_time * 60  # 转换为秒
+            speed = dist / flight_time_seconds if flight_time_seconds > 0 else self.instance.drone_params.speed
+            
+            # 预测瞬时功率并计算能耗
+            power = self.energy_model.predict_power(
+                height=DEFAULT_HEIGHT,
+                VS=0.0,  # 假设平飞
+                GS=speed,
+                wind_speed=DEFAULT_WIND_SPEED,
+                temperature=DEFAULT_TEMPERATURE,
+                humidity=DEFAULT_HUMIDITY,
+                wind_angle=DEFAULT_WIND_ANGLE,
+                payload=current_payload
+            )
+            energy = self.energy_model.energy_from_power(power, flight_time_seconds)
             trip_energy += energy
             trip_distance += dist
             
@@ -226,13 +252,21 @@ class MTDRPEvaluator:
         dist_to_depot = self.instance.distance_matrix[current_node, 0]
         travel_time_to_depot = self.instance.travel_time_matrix[current_node, 0]
         
-        if hasattr(self.energy_model, 'energy_consumption') and len(self.energy_model.energy_consumption.__code__.co_varnames) > 3:
-            # 物理模型需要 end_time 和 start_time 参数
-            flight_time_to_depot = travel_time_to_depot * 60  # 转换为秒
-            energy_to_depot = self.energy_model.energy_consumption(current_payload, current_time + flight_time_to_depot, current_time)
-        else:
-            # 其他模型使用标准接口
-            energy_to_depot = self.energy_model.energy_consumption(current_payload, dist_to_depot)
+        # 计算返回depot的能耗（使用瞬时功率模型）
+        flight_time_to_depot = travel_time_to_depot * 60  # 转换为秒
+        speed_to_depot = dist_to_depot / flight_time_to_depot if flight_time_to_depot > 0 else self.instance.drone_params.speed
+        
+        power_to_depot = self.energy_model.predict_power(
+            height=DEFAULT_HEIGHT,
+            VS=0.0,
+            GS=speed_to_depot,
+            wind_speed=DEFAULT_WIND_SPEED,
+            temperature=DEFAULT_TEMPERATURE,
+            humidity=DEFAULT_HUMIDITY,
+            wind_angle=DEFAULT_WIND_ANGLE,
+            payload=current_payload
+        )
+        energy_to_depot = self.energy_model.energy_from_power(power_to_depot, flight_time_to_depot)
         trip_energy += energy_to_depot
         trip_distance += dist_to_depot
         
