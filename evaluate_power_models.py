@@ -308,6 +308,121 @@ class PowerModelEvaluator:
         
         print(f"评估图表已保存到: {save_path}")
     
+    def plot_flight_power_curve(self, order_id: str = None, save_path: str = 'result/flight_power_curve.png'):
+        """
+        绘制单个航次的功率曲线（横轴时间，纵轴功率）
+        
+        参数:
+            order_id: 指定航次的Order ID，如果为None则自动选择第一个
+            save_path: 图表保存路径
+        """
+        if self.test_data is None:
+            print("[WARNING] 没有测试数据")
+            return
+        
+        # 获取可用的Order ID列表
+        if 'Order ID' not in self.test_data.columns:
+            print("[WARNING] 测试数据中没有Order ID列")
+            return
+        
+        available_orders = self.test_data['Order ID'].unique()
+        print(f"\n可用航次数: {len(available_orders)}")
+        
+        # 选择航次
+        if order_id is None:
+            order_id = available_orders[0]
+            print(f"自动选择第一个航次: {order_id}")
+        elif order_id not in available_orders:
+            print(f"[WARNING] 指定的Order ID不存在，使用第一个航次")
+            order_id = available_orders[0]
+        
+        # 提取该航次的数据
+        flight_data = self.test_data[self.test_data['Order ID'] == order_id].copy()
+        flight_data = flight_data.sort_values('Time Stamp').reset_index(drop=True)
+        
+        print(f"航次 {order_id} 数据点数: {len(flight_data)}")
+        
+        # 计算相对时间（秒）
+        if 'Time Stamp' in flight_data.columns:
+            # 转换时间戳为相对秒数
+            time_stamps = pd.to_datetime(flight_data['Time Stamp'])
+            flight_data['time_seconds'] = (time_stamps - time_stamps.iloc[0]).dt.total_seconds()
+        else:
+            # 如果没有时间戳，使用索引作为时间（假设每秒一条记录）
+            flight_data['time_seconds'] = range(len(flight_data))
+        
+        # 获取真实功率
+        true_power = flight_data['true_power'].values
+        time_axis = flight_data['time_seconds'].values
+        
+        # 在开头和结尾添加0点（表示起飞前和降落后功率为0）
+        time_axis = np.concatenate([[time_axis[0] - 5], time_axis, [time_axis[-1] + 5]])
+        true_power = np.concatenate([[0], true_power, [0]])
+        
+        # 计算各模型的预测功率（排除physical模型）
+        model_predictions = {}
+        for model_name, model in self.models.items():
+            if model_name == 'physical':
+                continue  # 跳过物理模型
+            predictions = []
+            for _, row in flight_data.iterrows():
+                pred = model.predict_power(
+                    height=row['height'],
+                    VS=row['VS'],
+                    GS=row['GS'],
+                    wind_speed=row['wind_speed'],
+                    temperature=row['temperature'],
+                    humidity=row['humidity'],
+                    wind_angle=row['wind_angle'],
+                    payload=row['payload']
+                )
+                predictions.append(pred)
+            # 在开头和结尾添加0点
+            predictions = np.concatenate([[0], predictions, [0]])
+            model_predictions[model_name] = predictions
+        
+        # 绘制功率曲线（单图）
+        fig, ax1 = plt.subplots(figsize=(14, 6))
+        
+        # 功率随时间变化
+        ax1.plot(time_axis, true_power, 'k-', linewidth=2, label='真实功率', alpha=0.8)
+        
+        colors = {'tree': 'green', 'deep': 'blue', 'linear': 'orange'}
+        for model_name, predictions in model_predictions.items():
+            color = colors.get(model_name, 'gray')
+            ax1.plot(time_axis, predictions, '--', linewidth=1.5, label=f'{model_name}预测', 
+                    color=color, alpha=0.7)
+        
+        ax1.set_xlabel('飞行时间 (秒)', fontsize=12)
+        ax1.set_ylabel('功率 (W)', fontsize=12)
+        ax1.set_title(f'航次功率曲线 - {order_id}', fontsize=14)
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        print(f"航次功率曲线已保存到: {save_path}")
+        
+        # 打印该航次的统计信息
+        print(f"\n航次统计:")
+        print(f"  飞行时长: {time_axis[-1]:.1f} 秒")
+        print(f"  真实功率: {true_power.min():.1f} - {true_power.max():.1f} W, 平均: {true_power.mean():.1f} W")
+        print(f"  载荷: {flight_data['payload'].min():.2f} - {flight_data['payload'].max():.2f} kg")
+        print(f"  地速: {flight_data['GS'].min():.1f} - {flight_data['GS'].max():.1f} m/s")
+        
+        # 计算总能耗
+        total_energy_true = np.sum(true_power) / 3600 / 1000  # kWh
+        print(f"\n能耗对比:")
+        print(f"  真实总能耗: {total_energy_true*1000:.2f} Wh")
+        for model_name, predictions in model_predictions.items():
+            total_energy_pred = np.sum(predictions) / 3600 / 1000
+            error_percent = abs(total_energy_pred - total_energy_true) / total_energy_true * 100
+            print(f"  {model_name}预测能耗: {total_energy_pred*1000:.2f} Wh (误差: {error_percent:.2f}%)")
+    
     def save_results(self, save_path: str = 'result/power_models_evaluation.csv'):
         """
         保存评估结果到CSV
@@ -389,6 +504,9 @@ def main():
         
         # 保存预测对比数据
         evaluator.save_predictions()
+        
+        # 绘制单个航次的功率曲线
+        evaluator.plot_flight_power_curve()
         
         print("\n" + "=" * 60)
         print("评估完成！")
