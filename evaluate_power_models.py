@@ -18,10 +18,119 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.rcParams['font.family'] = 'SimHei'
-matplotlib.rcParams['axes.unicode_minus'] = False
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator
+import matplotlib.patches as mpatches
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+# ============================================================================
+# 出版级图表配置 (Publication-Quality Plot Configuration)
+# ============================================================================
+
+def setup_publication_style():
+    """
+    设置出版级图表样式
+    - 使用Times New Roman字体
+    - 刻度线朝内
+    - 四边显示刻度，仅左下显示数值
+    - 无网格或极淡网格
+    """
+    plt.rcParams.update({
+        # 字体设置
+        'font.family': 'serif',
+        'font.serif': ['Times New Roman', 'DejaVu Serif'],
+        'font.size': 10,
+        'mathtext.fontset': 'stix',
+        
+        # 坐标轴设置
+        'axes.linewidth': 1.0,
+        'axes.labelsize': 11,
+        'axes.titlesize': 12,
+        'axes.labelweight': 'normal',
+        'axes.spines.top': True,
+        'axes.spines.right': True,
+        'axes.spines.left': True,
+        'axes.spines.bottom': True,
+        
+        # 刻度设置 - 朝内
+        'xtick.direction': 'in',
+        'ytick.direction': 'in',
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'xtick.major.size': 4,
+        'ytick.major.size': 4,
+        'xtick.minor.size': 2,
+        'ytick.minor.size': 2,
+        'xtick.major.width': 0.8,
+        'ytick.major.width': 0.8,
+        'xtick.minor.width': 0.6,
+        'ytick.minor.width': 0.6,
+        'xtick.top': True,
+        'xtick.bottom': True,
+        'ytick.left': True,
+        'ytick.right': True,
+        
+        # 图例设置
+        'legend.fontsize': 9,
+        'legend.frameon': False,
+        'legend.loc': 'best',
+        
+        # 线条设置
+        'lines.linewidth': 2.0,
+        'lines.markersize': 6,
+        
+        # 图像设置
+        'figure.dpi': 150,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'savefig.pad_inches': 0.05,
+        
+        # 其他
+        'axes.unicode_minus': False,
+    })
+
+
+# Nature/Science 风格配色方案 (柔和且对比度高)
+PUBLICATION_COLORS = {
+    'blue': '#4878D0',      # 柔和蓝
+    'orange': '#EE854A',    # 柔和橙
+    'green': '#6ACC64',     # 柔和绿
+    'red': '#D65F5F',       # 柔和红
+    'purple': '#956CB4',    # 柔和紫
+    'brown': '#8C613C',     # 柔和棕
+    'pink': '#DC7EC0',      # 柔和粉
+    'gray': '#797979',      # 中灰
+    'yellow': '#D5BB67',    # 柔和黄
+    'cyan': '#82C6E2',      # 柔和青
+    'black': '#2D2D2D',     # 深灰黑
+}
+
+# 模型配色映射
+MODEL_COLORS = {
+    'tree': PUBLICATION_COLORS['green'],
+    'deep': PUBLICATION_COLORS['blue'],
+    'linear': PUBLICATION_COLORS['orange'],
+    'physical': PUBLICATION_COLORS['gray'],
+    'actual': PUBLICATION_COLORS['black'],
+}
+
+# 模型显示名称
+MODEL_DISPLAY_NAMES = {
+    'tree': 'LightGBM',
+    'deep': 'Deep Learning',
+    'linear': 'Linear Regression',
+    'physical': 'Physical Model',
+}
+
+# 线型样式
+MODEL_LINESTYLES = {
+    'tree': '-',
+    'deep': '--',
+    'linear': '-.',
+    'physical': ':',
+    'actual': '-',
+}
 
 from mtdrp_energy_model import (
     create_power_model, PhysicalPowerModel, TreePowerModel,
@@ -260,62 +369,135 @@ class PowerModelEvaluator:
     
     def plot_results(self, save_path: str = 'result/power_models_evaluation.png'):
         """
-        绘制评估结果图
+        绘制评估结果图 - 出版级质量
         """
-        print("\n生成评估图表...")
+        print("\n生成出版级评估图表...")
         
-        valid_results = [(name, res) for name, res in self.results.items() if 'predictions' in res]
+        # 设置出版级样式
+        setup_publication_style()
+        
+        # 排除物理模型，只保留数据驱动模型
+        valid_results = [(name, res) for name, res in self.results.items() 
+                        if 'predictions' in res and name != 'physical']
         
         if not valid_results:
             print("[WARNING] 没有有效的评估结果可绘制")
             return
         
+        # 按R2排序
+        valid_results = sorted(valid_results, key=lambda x: x[1]['R2'], reverse=True)
         n_models = len(valid_results)
-        fig, axes = plt.subplots(2, n_models, figsize=(5*n_models, 10))
+        
+        # 黄金分割比例，适合双栏排版
+        fig_width = 3.5 * n_models  # 每列约3.5英寸
+        fig_height = 6.5  # 高度
+        fig, axes = plt.subplots(2, n_models, figsize=(fig_width, fig_height))
         
         if n_models == 1:
             axes = axes.reshape(2, 1)
         
         true_power = self.test_data['true_power'].values
+        subplot_labels = ['(a)', '(b)', '(c)', '(d)', '(e)', '(f)', '(g)', '(h)']
         
         for i, (model_name, res) in enumerate(valid_results):
             predictions = res['predictions']
+            color = MODEL_COLORS.get(model_name, PUBLICATION_COLORS['gray'])
+            display_name = MODEL_DISPLAY_NAMES.get(model_name, model_name)
             
-            # 散点图
+            # ========== 上行: 散点图 ==========
             ax1 = axes[0, i]
-            ax1.scatter(true_power, predictions, alpha=0.3, s=1)
-            ax1.plot([true_power.min(), true_power.max()], 
-                    [true_power.min(), true_power.max()], 'r--', lw=2)
-            ax1.set_xlabel('真实功率 (W)')
-            ax1.set_ylabel('预测功率 (W)')
-            ax1.set_title(f'{model_name}\nR2 = {res["R2"]:.4f}')
-            ax1.grid(True, alpha=0.3)
             
-            # 残差分布
+            # 绘制散点 - 使用半透明小点
+            ax1.scatter(true_power, predictions, 
+                       alpha=0.15, s=3, c=color, 
+                       edgecolors='none', rasterized=True)
+            
+            # 绘制理想线 (y=x)
+            lims = [min(true_power.min(), predictions.min()),
+                   max(true_power.max(), predictions.max())]
+            ax1.plot(lims, lims, '-', color=PUBLICATION_COLORS['red'], 
+                    linewidth=1.5, alpha=0.8, zorder=10)
+            
+            # 设置坐标轴范围
+            margin = (lims[1] - lims[0]) * 0.02
+            ax1.set_xlim(lims[0] - margin, lims[1] + margin)
+            ax1.set_ylim(lims[0] - margin, lims[1] + margin)
+            
+            # 标签
+            ax1.set_xlabel('Actual Power (W)')
+            ax1.set_ylabel('Predicted Power (W)')
+            
+            # 标题 - 左上角子图标签
+            ax1.text(-0.15, 1.05, subplot_labels[i], transform=ax1.transAxes,
+                    fontsize=11, fontweight='bold', va='bottom')
+            ax1.set_title(f'{display_name}', fontsize=10, pad=8)
+            
+            # 添加统计信息框 - 右下角
+            stats_text = f'R² = {res["R2"]:.4f}\nRMSE = {res["RMSE"]:.1f} W'
+            ax1.text(0.95, 0.05, stats_text, transform=ax1.transAxes,
+                    fontsize=8, ha='right', va='bottom',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                             edgecolor='none', alpha=0.8))
+            
+            # 添加次要刻度
+            ax1.xaxis.set_minor_locator(AutoMinorLocator(2))
+            ax1.yaxis.set_minor_locator(AutoMinorLocator(2))
+            
+            # ========== 下行: 残差分布 ==========
             ax2 = axes[1, i]
             residuals = true_power - predictions
-            ax2.hist(residuals, bins=50, alpha=0.7, edgecolor='black')
-            ax2.set_xlabel('残差 (W)')
-            ax2.set_ylabel('频次')
-            ax2.set_title(f'{model_name} 残差分布')
-            ax2.grid(True, alpha=0.3)
+            
+            # 绘制直方图 - 使用柔和颜色
+            n_bins = 60
+            counts, bins, patches = ax2.hist(residuals, bins=n_bins, 
+                                            color=color, alpha=0.7,
+                                            edgecolor='white', linewidth=0.3)
+            
+            # 添加垂直参考线 (x=0)
+            ax2.axvline(x=0, color=PUBLICATION_COLORS['red'], 
+                       linestyle='--', linewidth=1.2, alpha=0.8)
+            
+            # 标签
+            ax2.set_xlabel('Residual (W)')
+            ax2.set_ylabel('Frequency')
+            
+            # 子图标签
+            ax2.text(-0.15, 1.05, subplot_labels[i + n_models], transform=ax2.transAxes,
+                    fontsize=11, fontweight='bold', va='bottom')
+            
+            # 添加统计信息
+            mean_res = np.mean(residuals)
+            std_res = np.std(residuals)
+            stats_text2 = f'μ = {mean_res:.1f}\nσ = {std_res:.1f}'
+            ax2.text(0.95, 0.95, stats_text2, transform=ax2.transAxes,
+                    fontsize=8, ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                             edgecolor='none', alpha=0.8))
+            
+            # 添加次要刻度
+            ax2.xaxis.set_minor_locator(AutoMinorLocator(2))
+            ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
         
-        plt.tight_layout()
+        plt.tight_layout(pad=1.5)
         
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none')
         plt.show()
         
         print(f"评估图表已保存到: {save_path}")
     
     def plot_flight_power_curve(self, order_id: str = None, save_path: str = 'result/flight_power_curve.png'):
         """
-        绘制单个航次的功率曲线（横轴时间，纵轴功率）
+        绘制单个航次的功率曲线 - 出版级质量
         
         参数:
             order_id: 指定航次的Order ID，如果为None则自动选择第一个
             save_path: 图表保存路径
         """
+        # 设置出版级样式
+        setup_publication_style()
+        
         if self.test_data is None:
             print("[WARNING] 没有测试数据")
             return
@@ -344,26 +526,24 @@ class PowerModelEvaluator:
         
         # 计算相对时间（秒）
         if 'Time Stamp' in flight_data.columns:
-            # 转换时间戳为相对秒数
             time_stamps = pd.to_datetime(flight_data['Time Stamp'])
             flight_data['time_seconds'] = (time_stamps - time_stamps.iloc[0]).dt.total_seconds()
         else:
-            # 如果没有时间戳，使用索引作为时间（假设每秒一条记录）
             flight_data['time_seconds'] = range(len(flight_data))
         
         # 获取真实功率
         true_power = flight_data['true_power'].values
         time_axis = flight_data['time_seconds'].values
         
-        # 在开头和结尾添加0点（表示起飞前和降落后功率为0）
-        time_axis = np.concatenate([[time_axis[0] - 5], time_axis, [time_axis[-1] + 5]])
-        true_power = np.concatenate([[0], true_power, [0]])
+        # 在开头和结尾添加0点
+        time_axis_ext = np.concatenate([[time_axis[0] - 5], time_axis, [time_axis[-1] + 5]])
+        true_power_ext = np.concatenate([[0], true_power, [0]])
         
-        # 计算各模型的预测功率（排除physical模型）
+        # 计算各模型的预测功率
         model_predictions = {}
         for model_name, model in self.models.items():
             if model_name == 'physical':
-                continue  # 跳过物理模型
+                continue
             predictions = []
             for _, row in flight_data.iterrows():
                 pred = model.predict_power(
@@ -377,51 +557,82 @@ class PowerModelEvaluator:
                     payload=row['payload']
                 )
                 predictions.append(pred)
-            # 在开头和结尾添加0点
             predictions = np.concatenate([[0], predictions, [0]])
             model_predictions[model_name] = predictions
         
-        # 绘制功率曲线（单图）
-        fig, ax1 = plt.subplots(figsize=(14, 6))
+        # ============================================================
+        # 出版级图表绘制
+        # ============================================================
         
-        # 功率随时间变化
-        ax1.plot(time_axis, true_power, 'k-', linewidth=2, label='真实功率', alpha=0.8)
+        # 黄金分割比例: 1.618:1，适合双栏排版
+        fig_width = 7.0  # 英寸 (双栏宽度约7英寸)
+        fig_height = fig_width / 1.618
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
         
-        colors = {'tree': 'green', 'deep': 'blue', 'linear': 'orange'}
+        # 绘制真实功率 - 主曲线
+        ax.plot(time_axis_ext, true_power_ext, 
+               color=PUBLICATION_COLORS['black'], 
+               linewidth=2.2, 
+               label='Actual Power',
+               zorder=10)
+        
+        # 绘制各模型预测
         for model_name, predictions in model_predictions.items():
-            color = colors.get(model_name, 'gray')
-            ax1.plot(time_axis, predictions, '--', linewidth=1.5, label=f'{model_name}预测', 
-                    color=color, alpha=0.7)
+            color = MODEL_COLORS.get(model_name, PUBLICATION_COLORS['gray'])
+            linestyle = MODEL_LINESTYLES.get(model_name, '--')
+            display_name = MODEL_DISPLAY_NAMES.get(model_name, model_name)
+            
+            ax.plot(time_axis_ext, predictions,
+                   color=color,
+                   linestyle=linestyle,
+                   linewidth=1.8,
+                   label=display_name,
+                   alpha=0.85,
+                   zorder=5)
         
-        ax1.set_xlabel('飞行时间 (秒)', fontsize=12)
-        ax1.set_ylabel('功率 (W)', fontsize=12)
-        ax1.set_title(f'航次功率曲线 - {order_id}', fontsize=14)
-        ax1.legend(loc='upper right')
-        ax1.grid(True, alpha=0.3)
+        # 设置坐标轴
+        ax.set_xlabel('Flight Time (s)')
+        ax.set_ylabel('Power (W)')
         
-        plt.tight_layout()
+        # 设置坐标轴范围
+        ax.set_xlim(time_axis_ext[0] - 2, time_axis_ext[-1] + 2)
+        y_min = 0
+        y_max = max(true_power_ext.max(), max([p.max() for p in model_predictions.values()])) * 1.08
+        ax.set_ylim(y_min, y_max)
+        
+        # 添加次要刻度
+        ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+        
+        # 图例 - 无边框，放在右上角不遮挡数据
+        legend = ax.legend(loc='upper right', frameon=False, 
+                          fontsize=9, ncol=1,
+                          handlelength=2.5, handletextpad=0.5)
+        
+        
+        plt.tight_layout(pad=0.5)
         
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                   facecolor='white', edgecolor='none')
         plt.show()
         
         print(f"航次功率曲线已保存到: {save_path}")
         
-        # 打印该航次的统计信息
+        # 打印统计信息
         print(f"\n航次统计:")
         print(f"  飞行时长: {time_axis[-1]:.1f} 秒")
         print(f"  真实功率: {true_power.min():.1f} - {true_power.max():.1f} W, 平均: {true_power.mean():.1f} W")
         print(f"  载荷: {flight_data['payload'].min():.2f} - {flight_data['payload'].max():.2f} kg")
         print(f"  地速: {flight_data['GS'].min():.1f} - {flight_data['GS'].max():.1f} m/s")
         
-        # 计算总能耗
-        total_energy_true = np.sum(true_power) / 3600 / 1000  # kWh
+        # 能耗对比
         print(f"\n能耗对比:")
-        print(f"  真实总能耗: {total_energy_true*1000:.2f} Wh")
+        print(f"  真实总能耗: {total_energy_true:.2f} Wh")
         for model_name, predictions in model_predictions.items():
-            total_energy_pred = np.sum(predictions) / 3600 / 1000
+            total_energy_pred = np.sum(predictions) / 3600
             error_percent = abs(total_energy_pred - total_energy_true) / total_energy_true * 100
-            print(f"  {model_name}预测能耗: {total_energy_pred*1000:.2f} Wh (误差: {error_percent:.2f}%)")
+            print(f"  {model_name}预测能耗: {total_energy_pred:.2f} Wh (误差: {error_percent:.2f}%)")
     
     def save_results(self, save_path: str = 'result/power_models_evaluation.csv'):
         """
@@ -473,6 +684,88 @@ class PowerModelEvaluator:
         comparison_df.to_csv(save_path, index=False, encoding='utf-8-sig')
         print(f"预测对比数据已保存到: {save_path}")
         print(f"共 {len(comparison_df)} 条记录")
+    
+    def plot_model_comparison_bar(self, save_path: str = 'result/power_models_bar_comparison.png'):
+        """
+        绘制模型性能对比柱状图 - 出版级质量
+        """
+        setup_publication_style()
+        
+        # 排除物理模型，只保留数据驱动模型
+        valid_results = [(name, res) for name, res in self.results.items() 
+                        if 'R2' in res and name != 'physical']
+        if not valid_results:
+            print("[WARNING] 没有有效的评估结果")
+            return
+        
+        # 按R2排序
+        valid_results = sorted(valid_results, key=lambda x: x[1]['R2'], reverse=True)
+        
+        model_names = [MODEL_DISPLAY_NAMES.get(name, name) for name, _ in valid_results]
+        rmse_values = [res['RMSE'] for _, res in valid_results]
+        r2_values = [res['R2'] for _, res in valid_results]
+        colors = [MODEL_COLORS.get(name, PUBLICATION_COLORS['gray']) for name, _ in valid_results]
+        
+        # 创建双子图
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 3.2))
+        
+        x = np.arange(len(model_names))
+        bar_width = 0.6
+        
+        # ========== 左图: RMSE ==========
+        bars1 = ax1.bar(x, rmse_values, bar_width, color=colors, 
+                       edgecolor='white', linewidth=0.8, alpha=0.85)
+        ax1.set_ylabel('RMSE (W)')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(model_names, rotation=25, ha='right', fontsize=8)
+        ax1.set_ylim(0, max(rmse_values) * 1.2)
+        
+        # 添加数值标签
+        for bar, val in zip(bars1, rmse_values):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(rmse_values)*0.02,
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=8)
+        
+        ax1.text(-0.15, 1.05, '(a)', transform=ax1.transAxes,
+                fontsize=11, fontweight='bold')
+        ax1.xaxis.set_minor_locator(AutoMinorLocator(2))
+        ax1.yaxis.set_minor_locator(AutoMinorLocator(2))
+        
+        # ========== 右图: R² ==========
+        bars2 = ax2.bar(x, r2_values, bar_width, color=colors,
+                       edgecolor='white', linewidth=0.8, alpha=0.85)
+        ax2.set_ylabel('R² Score')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(model_names, rotation=25, ha='right', fontsize=8)
+        
+        # R²可能有负值
+        min_r2 = min(r2_values)
+        if min_r2 < 0:
+            ax2.set_ylim(min_r2 * 1.2, 1.05)
+            ax2.axhline(y=0, color=PUBLICATION_COLORS['gray'], 
+                       linestyle='-', linewidth=0.5, alpha=0.5)
+        else:
+            ax2.set_ylim(0, 1.05)
+        
+        # 添加数值标签
+        for bar, val in zip(bars2, r2_values):
+            offset = max(r2_values) * 0.02 if val >= 0 else -max(r2_values) * 0.08
+            va = 'bottom' if val >= 0 else 'top'
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + offset,
+                    f'{val:.3f}', ha='center', va=va, fontsize=8)
+        
+        ax2.text(-0.15, 1.05, '(b)', transform=ax2.transAxes,
+                fontsize=11, fontweight='bold')
+        ax2.xaxis.set_minor_locator(AutoMinorLocator(2))
+        ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+        
+        plt.tight_layout(pad=1.0)
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                   facecolor='white', edgecolor='none')
+        plt.show()
+        
+        print(f"模型对比柱状图已保存到: {save_path}")
 
 
 def main():
@@ -496,8 +789,11 @@ def main():
         # 打印汇总
         evaluator.print_summary()
         
-        # 绘制结果
+        # 绘制结果 (出版级质量)
         evaluator.plot_results()
+        
+        # 绘制模型性能对比柱状图 (出版级质量)
+        evaluator.plot_model_comparison_bar()
         
         # 保存结果
         evaluator.save_results()
@@ -505,7 +801,7 @@ def main():
         # 保存预测对比数据
         evaluator.save_predictions()
         
-        # 绘制单个航次的功率曲线
+        # 绘制单个航次的功率曲线 (出版级质量)
         evaluator.plot_flight_power_curve()
         
         print("\n" + "=" * 60)
