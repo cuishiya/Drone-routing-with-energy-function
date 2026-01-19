@@ -251,6 +251,10 @@ class EnergyModelEvaluator:
         if use_real_data:
             print("使用test_data文件夹中的测试数据进行评估...")
             features, targets, flight_times, start_times, end_times = self.load_test_data_from_folder()
+            # 保存为实例变量，供绘图使用
+            self.flight_times = flight_times
+            self.start_times = start_times
+            self.end_times = end_times
         else:
             print("[ERROR] 不支持合成数据模式")
             raise ValueError("仅支持真实数据评估模式")
@@ -340,72 +344,166 @@ class EnergyModelEvaluator:
         self.plot_prediction_scatter(features, targets)
     
     def plot_performance_comparison(self):
-        """绘制性能对比图"""
+        """绘制性能对比图 - SCI论文风格"""
         if not self.evaluation_results:
             return
         
         try:
+            # SCI论文风格设置
+            plt.style.use('seaborn-v0_8-whitegrid')
+            plt.rcParams.update({
+                'font.family': 'Times New Roman',
+                'font.size': 11,
+                'axes.labelsize': 12,
+                'axes.titlesize': 13,
+                'xtick.labelsize': 10,
+                'ytick.labelsize': 10,
+                'legend.fontsize': 10,
+                'axes.linewidth': 1.2,
+                'axes.edgecolor': '#333333',
+                'grid.alpha': 0.3,
+                'grid.linestyle': '--',
+            })
+            
             # 准备数据
             model_names = list(self.evaluation_results.keys())
+            # 模型名称美化
+            display_names = {
+                'physical': 'Physical',
+                'linear': 'Linear Reg.',
+                'tree': 'LightGBM',
+                'deep': 'Deep Learning'
+            }
+            labels = [display_names.get(name, name) for name in model_names]
+            
             rmse_values = [self.evaluation_results[name]['RMSE'] for name in model_names]
             mae_values = [self.evaluation_results[name]['MAE'] for name in model_names]
             r2_values = [self.evaluation_results[name]['R2'] for name in model_names]
             
-            # 创建子图 (3个指标)
-            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+            # SCI配色方案 (Nature风格)
+            colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B3'][:len(model_names)]
             
-            colors = ['blue', 'green', 'red', 'orange'][:len(model_names)]
+            # 创建图形
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
             
-            # RMSE对比
-            bars1 = ax1.bar(model_names, rmse_values, color=colors)
-            ax1.set_title('RMSE对比 (越小越好)')
-            ax1.set_ylabel('RMSE')
-            ax1.tick_params(axis='x', rotation=45)
+            # 通用柱状图样式
+            bar_width = 0.6
+            edge_color = '#333333'
+            
+            # (a) RMSE对比
+            ax1 = axes[0]
+            bars1 = ax1.bar(labels, rmse_values, width=bar_width, color=colors, 
+                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
+            ax1.set_ylabel('RMSE (kWh)', fontweight='bold')
+            ax1.set_title('(a) RMSE Comparison', fontweight='bold', pad=10)
+            ax1.set_ylim(0, max(rmse_values) * 1.25)
+            ax1.tick_params(axis='x', rotation=30)
+            # 添加数值标签
             for bar, value in zip(bars1, rmse_values):
-                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(rmse_values)*0.01,
-                        f'{value:.4f}', ha='center', va='bottom')
+                ax1.annotate(f'{value:.4f}', 
+                            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                            xytext=(0, 5), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+            ax1.spines['top'].set_visible(False)
+            ax1.spines['right'].set_visible(False)
             
-            # MAE对比
-            bars2 = ax2.bar(model_names, mae_values, color=colors)
-            ax2.set_title('MAE对比 (越小越好)')
-            ax2.set_ylabel('MAE')
-            ax2.tick_params(axis='x', rotation=45)
+            # (b) MAE对比
+            ax2 = axes[1]
+            bars2 = ax2.bar(labels, mae_values, width=bar_width, color=colors,
+                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
+            ax2.set_ylabel('MAE (kWh)', fontweight='bold')
+            ax2.set_title('(b) MAE Comparison', fontweight='bold', pad=10)
+            ax2.set_ylim(0, max(mae_values) * 1.25)
+            ax2.tick_params(axis='x', rotation=30)
             for bar, value in zip(bars2, mae_values):
-                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(mae_values)*0.01,
-                        f'{value:.4f}', ha='center', va='bottom')
+                ax2.annotate(f'{value:.4f}',
+                            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                            xytext=(0, 5), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
             
-            # R2对比
-            bars3 = ax3.bar(model_names, r2_values, color=colors)
-            ax3.set_title('R2对比 (越大越好)')
-            ax3.set_ylabel('R2')
-            ax3.tick_params(axis='x', rotation=45)
+            # (c) R² 对比
+            ax3 = axes[2]
+            bars3 = ax3.bar(labels, r2_values, width=bar_width, color=colors,
+                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
+            ax3.set_ylabel('R² Score', fontweight='bold')
+            ax3.set_title('(c) R² Comparison', fontweight='bold', pad=10)
+            # R²可能有负值，设置合适的范围
+            min_r2 = min(r2_values)
+            max_r2 = max(r2_values)
+            if min_r2 < 0:
+                ax3.set_ylim(min_r2 * 1.2, max_r2 * 1.15)
+                ax3.axhline(y=0, color='#666666', linestyle='-', linewidth=0.8, alpha=0.5)
+            else:
+                ax3.set_ylim(0, max_r2 * 1.15)
+            ax3.tick_params(axis='x', rotation=30)
             for bar, value in zip(bars3, r2_values):
-                ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                        f'{value:.4f}', ha='center', va='bottom')
+                offset = 5 if value >= 0 else -15
+                va = 'bottom' if value >= 0 else 'top'
+                ax3.annotate(f'{value:.4f}',
+                            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                            xytext=(0, offset), textcoords='offset points',
+                            ha='center', va=va, fontsize=9, fontweight='bold')
+            ax3.spines['top'].set_visible(False)
+            ax3.spines['right'].set_visible(False)
             
-            plt.tight_layout()
-            plt.savefig('result/energy_models_performance_comparison.png', dpi=300, bbox_inches='tight')
+            plt.tight_layout(pad=2.0)
+            plt.savefig('result/energy_models_performance_comparison.png', 
+                       dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
             plt.show()
+            
+            # 恢复默认设置
+            plt.rcParams.update(plt.rcParamsDefault)
+            matplotlib.rcParams['font.family'] = 'SimHei'
+            matplotlib.rcParams['axes.unicode_minus'] = False
             
             print(f"性能对比图已保存为: result/energy_models_performance_comparison.png")
             
         except Exception as e:
             print(f"[ERROR] 绘制性能对比图失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def plot_prediction_scatter(self, features, targets):
-        """绘制预测vs真值散点图"""
+        """绘制预测vs真值散点图 - SCI论文风格"""
         if not self.evaluation_results:
             return
         
         try:
+            # SCI论文风格设置
+            plt.style.use('seaborn-v0_8-whitegrid')
+            plt.rcParams.update({
+                'font.family': 'Times New Roman',
+                'font.size': 11,
+                'axes.labelsize': 12,
+                'axes.titlesize': 13,
+                'xtick.labelsize': 10,
+                'ytick.labelsize': 10,
+                'legend.fontsize': 10,
+                'axes.linewidth': 1.2,
+                'axes.edgecolor': '#333333',
+            })
+            
             n_models = len([m for m in self.models.values() if m is not None])
             if n_models == 0:
                 return
             
-            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+            # 模型名称美化
+            display_names = {
+                'physical': 'Physical Model',
+                'linear': 'Linear Regression',
+                'tree': 'LightGBM',
+                'deep': 'Deep Learning'
+            }
+            
+            # SCI配色方案
+            colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B3']
+            
+            fig, axes = plt.subplots(2, 2, figsize=(10, 9))
             axes = axes.flatten()
             
-            colors = ['blue', 'green', 'red', 'orange']
+            subplot_labels = ['(a)', '(b)', '(c)', '(d)']
             
             plot_idx = 0
             for model_name, model in self.models.items():
@@ -413,7 +511,13 @@ class EnergyModelEvaluator:
                     continue
                 
                 # 获取预测值
-                predictions = self.predict_energy(model, features)
+                predictions = self.predict_energy(
+                    model, features, 
+                    getattr(self, 'flight_times', np.zeros(len(targets))),
+                    getattr(self, 'start_times', np.zeros(len(targets))),
+                    getattr(self, 'end_times', np.zeros(len(targets))),
+                    model_name
+                )
                 
                 # 过滤有效值
                 valid_mask = (predictions > 0) & (targets > 0)
@@ -423,23 +527,57 @@ class EnergyModelEvaluator:
                 if len(valid_targets) == 0:
                     continue
                 
-                # 绘制散点图
                 ax = axes[plot_idx]
-                ax.scatter(valid_targets, valid_predictions, alpha=0.6, color=colors[plot_idx], s=20)
                 
-                # 绘制理想线 (y=x)
+                # 绘制散点图 - 使用更专业的样式
+                scatter = ax.scatter(valid_targets, valid_predictions, 
+                                    alpha=0.5, color=colors[plot_idx], 
+                                    s=25, edgecolors='white', linewidth=0.3)
+                
+                # 绘制理想线 (y=x) - 使用红色虚线
                 min_val = min(valid_targets.min(), valid_predictions.min())
                 max_val = max(valid_targets.max(), valid_predictions.max())
-                ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.8, linewidth=2)
+                margin = (max_val - min_val) * 0.05
+                line_range = [min_val - margin, max_val + margin]
+                ax.plot(line_range, line_range, 'r--', linewidth=1.5, 
+                       label='Ideal (y=x)', alpha=0.8)
                 
-                ax.set_xlabel('真实值 (kWh)')
-                ax.set_ylabel('预测值 (kWh)')
-                ax.set_title(f'{model_name} 模型预测效果')
+                # 设置坐标轴
+                ax.set_xlim(line_range)
+                ax.set_ylim(line_range)
+                ax.set_xlabel('Actual Energy (kWh)', fontweight='bold')
+                ax.set_ylabel('Predicted Energy (kWh)', fontweight='bold')
                 
-                # 添加R2信息
+                # 标题
+                title_name = display_names.get(model_name, model_name)
+                ax.set_title(f'{subplot_labels[plot_idx]} {title_name}', 
+                            fontweight='bold', pad=10, loc='left')
+                
+                # 添加统计信息框
                 r2 = self.evaluation_results[model_name]['R2']
-                ax.text(0.05, 0.95, f'R2 = {r2:.4f}', transform=ax.transAxes, 
-                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                rmse = self.evaluation_results[model_name]['RMSE']
+                mae = self.evaluation_results[model_name]['MAE']
+                
+                stats_text = f'R² = {r2:.4f}\nRMSE = {rmse:.4f}\nMAE = {mae:.4f}'
+                props = dict(boxstyle='round,pad=0.4', facecolor='white', 
+                            edgecolor='#666666', alpha=0.9, linewidth=1)
+                ax.text(0.05, 0.95, stats_text, transform=ax.transAxes,
+                       fontsize=9, verticalalignment='top',
+                       bbox=props, family='Times New Roman')
+                
+                # 添加样本数量
+                n_samples = len(valid_targets)
+                ax.text(0.95, 0.05, f'n = {n_samples}', transform=ax.transAxes,
+                       fontsize=9, ha='right', va='bottom',
+                       family='Times New Roman', style='italic')
+                
+                # 移除上边和右边的边框
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                
+                # 设置网格
+                ax.grid(True, linestyle='--', alpha=0.3, color='gray')
+                ax.set_axisbelow(True)
                 
                 plot_idx += 1
             
@@ -447,14 +585,22 @@ class EnergyModelEvaluator:
             for i in range(plot_idx, 4):
                 axes[i].set_visible(False)
             
-            plt.tight_layout()
-            plt.savefig('result/energy_models_prediction_scatter.png', dpi=300, bbox_inches='tight')
+            plt.tight_layout(pad=2.5)
+            plt.savefig('result/energy_models_prediction_scatter.png', 
+                       dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
             plt.show()
+            
+            # 恢复默认设置
+            plt.rcParams.update(plt.rcParamsDefault)
+            matplotlib.rcParams['font.family'] = 'SimHei'
+            matplotlib.rcParams['axes.unicode_minus'] = False
             
             print(f"预测散点图已保存为: result/energy_models_prediction_scatter.png")
             
         except Exception as e:
             print(f"[ERROR] 绘制预测散点图失败: {e}")
+            import traceback
+            traceback.print_exc()
 
 def create_test_instance():
     """创建测试用的MTDRP实例"""
