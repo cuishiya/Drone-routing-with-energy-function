@@ -344,109 +344,98 @@ class EnergyModelEvaluator:
         self.plot_prediction_scatter(features, targets)
     
     def plot_performance_comparison(self):
-        """绘制性能对比图 - SCI论文风格"""
+        """绘制性能对比图 - 与参考图片风格一致"""
         if not self.evaluation_results:
             return
         
         try:
-            # SCI论文风格设置
-            plt.style.use('seaborn-v0_8-whitegrid')
+            # 设置绘图风格
             plt.rcParams.update({
                 'font.family': 'Times New Roman',
-                'font.size': 11,
-                'axes.labelsize': 12,
-                'axes.titlesize': 13,
-                'xtick.labelsize': 10,
-                'ytick.labelsize': 10,
-                'legend.fontsize': 10,
-                'axes.linewidth': 1.2,
-                'axes.edgecolor': '#333333',
-                'grid.alpha': 0.3,
-                'grid.linestyle': '--',
+                'font.size': 12,
+                'axes.labelsize': 14,
+                'axes.titlesize': 14,
+                'xtick.labelsize': 11,
+                'ytick.labelsize': 11,
+                'axes.linewidth': 1.0,
             })
             
-            # 准备数据
-            model_names = list(self.evaluation_results.keys())
+            # 指定模型顺序：树模型 → 深度学习 → 线性模型 → 物理模型
+            model_order = ['tree', 'deep', 'linear', 'physical']
+            
             # 模型名称美化
             display_names = {
                 'physical': 'Physical',
-                'linear': 'Linear Reg.',
+                'linear': 'Linear Regression',
                 'tree': 'LightGBM',
                 'deep': 'Deep Learning'
             }
-            labels = [display_names.get(name, name) for name in model_names]
             
-            rmse_values = [self.evaluation_results[name]['RMSE'] for name in model_names]
-            mae_values = [self.evaluation_results[name]['MAE'] for name in model_names]
-            r2_values = [self.evaluation_results[name]['R2'] for name in model_names]
+            # 按指定顺序筛选存在的模型
+            ordered_models = [m for m in model_order if m in self.evaluation_results]
             
-            # SCI配色方案 (Nature风格)
-            colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B3'][:len(model_names)]
+            labels = [display_names.get(name, name) for name in ordered_models]
+            rmse_values = [self.evaluation_results[name]['RMSE'] for name in ordered_models]
+            r2_values = [self.evaluation_results[name]['R2'] for name in ordered_models]
             
-            # 创建图形
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            # 与参考图片一致的配色方案（绿、蓝、橙）
+            colors = ['#7BC47F', '#6A9FD4', '#F5A962', '#E57373'][:len(ordered_models)]
+            
+            # 创建图形 - 只显示RMSE和R²两个子图
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
             
             # 通用柱状图样式
-            bar_width = 0.6
-            edge_color = '#333333'
+            bar_width = 0.5
             
             # (a) RMSE对比
             ax1 = axes[0]
-            bars1 = ax1.bar(labels, rmse_values, width=bar_width, color=colors, 
-                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
-            ax1.set_ylabel('RMSE (kWh)', fontweight='bold')
-            ax1.set_title('(a) RMSE Comparison', fontweight='bold', pad=10)
-            ax1.set_ylim(0, max(rmse_values) * 1.25)
-            ax1.tick_params(axis='x', rotation=30)
-            # 添加数值标签
+            x_pos = np.arange(len(labels))
+            bars1 = ax1.bar(x_pos, rmse_values, width=bar_width, color=colors, 
+                           edgecolor='none')
+            ax1.set_ylabel('RMSE (kWh)', fontweight='normal')
+            ax1.set_title('(a)', fontweight='bold', loc='left', pad=10)
+            ax1.set_ylim(0, max(rmse_values) * 1.2)
+            ax1.set_xticks(x_pos)
+            ax1.set_xticklabels(labels, rotation=30, ha='right')
+            
+            # 添加数值标签 - 在柱子顶部
             for bar, value in zip(bars1, rmse_values):
                 ax1.annotate(f'{value:.4f}', 
                             xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                            xytext=(0, 5), textcoords='offset points',
-                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+                            xytext=(0, 3), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=10)
+            
+            # 移除上边和右边边框
             ax1.spines['top'].set_visible(False)
             ax1.spines['right'].set_visible(False)
+            ax1.spines['left'].set_color('#333333')
+            ax1.spines['bottom'].set_color('#333333')
             
-            # (b) MAE对比
+            # (b) R² 对比
             ax2 = axes[1]
-            bars2 = ax2.bar(labels, mae_values, width=bar_width, color=colors,
-                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
-            ax2.set_ylabel('MAE (kWh)', fontweight='bold')
-            ax2.set_title('(b) MAE Comparison', fontweight='bold', pad=10)
-            ax2.set_ylim(0, max(mae_values) * 1.25)
-            ax2.tick_params(axis='x', rotation=30)
-            for bar, value in zip(bars2, mae_values):
-                ax2.annotate(f'{value:.4f}',
-                            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                            xytext=(0, 5), textcoords='offset points',
-                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+            # 过滤掉负值的R²用于显示（物理模型可能为负）
+            r2_display = [max(0, v) for v in r2_values]
+            bars2 = ax2.bar(x_pos, r2_display, width=bar_width, color=colors,
+                           edgecolor='none')
+            ax2.set_ylabel('R² Score', fontweight='normal')
+            ax2.set_title('(b)', fontweight='bold', loc='left', pad=10)
+            ax2.set_ylim(0, 1.0)
+            ax2.set_xticks(x_pos)
+            ax2.set_xticklabels(labels, rotation=30, ha='right')
+            
+            # 添加数值标签
+            for bar, value in zip(bars2, r2_values):
+                display_val = max(0, value)
+                ax2.annotate(f'{value:.3f}', 
+                            xy=(bar.get_x() + bar.get_width()/2, display_val),
+                            xytext=(0, 3), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=10)
+            
+            # 移除上边和右边边框
             ax2.spines['top'].set_visible(False)
             ax2.spines['right'].set_visible(False)
-            
-            # (c) R² 对比
-            ax3 = axes[2]
-            bars3 = ax3.bar(labels, r2_values, width=bar_width, color=colors,
-                           edgecolor=edge_color, linewidth=1.2, alpha=0.85)
-            ax3.set_ylabel('R² Score', fontweight='bold')
-            ax3.set_title('(c) R² Comparison', fontweight='bold', pad=10)
-            # R²可能有负值，设置合适的范围
-            min_r2 = min(r2_values)
-            max_r2 = max(r2_values)
-            if min_r2 < 0:
-                ax3.set_ylim(min_r2 * 1.2, max_r2 * 1.15)
-                ax3.axhline(y=0, color='#666666', linestyle='-', linewidth=0.8, alpha=0.5)
-            else:
-                ax3.set_ylim(0, max_r2 * 1.15)
-            ax3.tick_params(axis='x', rotation=30)
-            for bar, value in zip(bars3, r2_values):
-                offset = 5 if value >= 0 else -15
-                va = 'bottom' if value >= 0 else 'top'
-                ax3.annotate(f'{value:.4f}',
-                            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                            xytext=(0, offset), textcoords='offset points',
-                            ha='center', va=va, fontsize=9, fontweight='bold')
-            ax3.spines['top'].set_visible(False)
-            ax3.spines['right'].set_visible(False)
+            ax2.spines['left'].set_color('#333333')
+            ax2.spines['bottom'].set_color('#333333')
             
             plt.tight_layout(pad=2.0)
             plt.savefig('result/energy_models_performance_comparison.png', 
@@ -466,28 +455,24 @@ class EnergyModelEvaluator:
             traceback.print_exc()
     
     def plot_prediction_scatter(self, features, targets):
-        """绘制预测vs真值散点图 - SCI论文风格"""
+        """绘制预测vs真值散点图 - 与参考图片风格一致"""
         if not self.evaluation_results:
             return
         
         try:
-            # SCI论文风格设置
-            plt.style.use('seaborn-v0_8-whitegrid')
+            # 设置绘图风格
             plt.rcParams.update({
                 'font.family': 'Times New Roman',
-                'font.size': 11,
-                'axes.labelsize': 12,
-                'axes.titlesize': 13,
-                'xtick.labelsize': 10,
-                'ytick.labelsize': 10,
-                'legend.fontsize': 10,
-                'axes.linewidth': 1.2,
-                'axes.edgecolor': '#333333',
+                'font.size': 12,
+                'axes.labelsize': 14,
+                'axes.titlesize': 14,
+                'xtick.labelsize': 11,
+                'ytick.labelsize': 11,
+                'axes.linewidth': 1.0,
             })
             
-            n_models = len([m for m in self.models.values() if m is not None])
-            if n_models == 0:
-                return
+            # 指定模型顺序：树模型 → 深度学习 → 线性模型 → 物理模型
+            model_order = ['tree', 'deep', 'linear', 'physical']
             
             # 模型名称美化
             display_names = {
@@ -497,8 +482,8 @@ class EnergyModelEvaluator:
                 'deep': 'Deep Learning'
             }
             
-            # SCI配色方案
-            colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B3']
+            # 与参考图片一致的配色方案（绿、蓝、橙、红）
+            colors = ['#7BC47F', '#6A9FD4', '#F5A962', '#E57373']
             
             fig, axes = plt.subplots(2, 2, figsize=(10, 9))
             axes = axes.flatten()
@@ -506,9 +491,11 @@ class EnergyModelEvaluator:
             subplot_labels = ['(a)', '(b)', '(c)', '(d)']
             
             plot_idx = 0
-            for model_name, model in self.models.items():
-                if model is None or plot_idx >= 4:
+            for model_name in model_order:
+                if model_name not in self.models or self.models[model_name] is None or plot_idx >= 4:
                     continue
+                
+                model = self.models[model_name]
                 
                 # 获取预测值
                 predictions = self.predict_energy(
