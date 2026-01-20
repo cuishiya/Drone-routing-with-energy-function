@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-多行程无人机路径问题 (MTDRP) - 瞬时功率预测模型
+多行程无人机路径问题 (MTDRP) - LSTM Seq2Seq 瞬时功率预测模型
 
 基于论文: "Drone routing with energy function: Formulation and exact algorithm"
 
 核心特点:
-1. 瞬时功率预测: 基于飞行状态预测当前功率
+1. 瞬时功率预测: 基于LSTM Seq2Seq模型利用时序特征预测功率序列
 2. 多行程支持: 无人机可返回配送中心换电池后继续执行任务
 3. 时间窗约束: 每个客户有到达时间窗 [a_i, b_i]
 4. 载重约束: 无人机最大载重限制 Q
 
-模型输入特征:
+模型输入特征序列 (每个时刻7个特征):
 - height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -20,6 +20,8 @@
 - temperature: 温度 [°C]
 - humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+
+模型输出: 瞬时功率序列 [W]
 
 使用 RLTS-NSGA-II 算法求解
 """
@@ -31,21 +33,13 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import pickle
 
-# 尝试导入LightGBM
-try:
-    import lightgbm as lgb
-    LIGHTGBM_AVAILABLE = True
-except ImportError:
-    print("[WARNING] LightGBM未安装，树模型将不可用")
-    LIGHTGBM_AVAILABLE = False
-
 # 尝试导入PyTorch
 try:
     import torch
     import torch.nn as nn
     PYTORCH_AVAILABLE = True
 except ImportError:
-    print("[WARNING] PyTorch未安装，深度学习模型将不可用")
+    print("[WARNING] PyTorch未安装，LSTM模型将不可用")
     PYTORCH_AVAILABLE = False
 
 
@@ -198,310 +192,354 @@ def load_instance(filepath: str) -> MTDRPInstance:
     )
 
 
-# ==================== 物理功率模型 ====================
+# ==================== LSTM Seq2Seq 模型定义 ====================
 
-class PhysicalPowerModel:
-    """
-    基于物理公式的瞬时功率模型
-    
-    P(q) = k * (W + m + q)^(3/2)
-    """
-    
-    def __init__(self, drone_params: DroneParameters = None):
-        self.params = drone_params or DroneParameters()
-        self.k = self.params.k
+class LSTMEncoder(nn.Module):
+    """LSTM编码器"""
+    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
+        super(LSTMEncoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
         
-    def predict_power(self, payload: float = 0.0) -> float:
-        """
-        预测瞬时功率 [W]
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+    
+    def forward(self, x):
+        outputs, (hidden, cell) = self.lstm(x)
+        return outputs, hidden, cell
+
+
+class LSTMDecoder(nn.Module):
+    """LSTM解码器"""
+    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
+        super(LSTMDecoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_directions = 2 if bidirectional else 1
         
-        P(q) = k * (W + m + q)^(3/2)
-        """
-        total_weight = self.params.W + self.params.m + payload
-        return self.k * (total_weight ** 1.5)
+        decoder_input_size = hidden_size * self.num_directions
+        
+        self.lstm = nn.LSTM(
+            input_size=decoder_input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
     
-    def energy_from_power(self, power: float, duration_seconds: float) -> float:
-        """根据功率和时间计算能耗 [kWh]"""
-        energy_wh = power * (duration_seconds / 3600.0)
-        return energy_wh / 1000.0
+    def forward(self, encoder_outputs, hidden, cell):
+        decoder_outputs, _ = self.lstm(encoder_outputs, (hidden, cell))
+        outputs = self.fc(decoder_outputs)
+        return outputs.squeeze(-1)
 
 
-# ==================== LightGBM树模型 ====================
+class LSTMSeq2Seq(nn.Module):
+    """LSTM Seq2Seq 完整模型"""
+    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
+                 dropout=0.2, bidirectional=True):
+        super(LSTMSeq2Seq, self).__init__()
+        
+        self.encoder = LSTMEncoder(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+        
+        self.decoder = LSTMDecoder(
+            hidden_size=hidden_size,
+            output_size=1,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+    
+    def forward(self, x):
+        encoder_outputs, hidden, cell = self.encoder(x)
+        outputs = self.decoder(encoder_outputs, hidden, cell)
+        return outputs
 
-class TreePowerModel:
+
+# ==================== LSTM Seq2Seq 功率预测模型 ====================
+
+class LSTMPowerModel:
     """
-    基于LightGBM的瞬时功率预测模型
+    基于LSTM Seq2Seq的瞬时功率预测模型
     
-    输入: height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload
-    输出: 瞬时功率 [W]
+    输入: 特征序列 (seq_len, 7) - height, VS, GS, wind_speed, temperature, humidity, wind_angle
+    输出: 功率序列 (seq_len,) [W]
     """
     
-    def __init__(self, model_path: str = 'result/power_lgb_model.txt'):
+    def __init__(self, model_path: str = 'result/power_lstm_seq2seq_model.pth'):
         self.model_path = model_path
         self.model = None
-        self.feature_names = ['height', 'VS', 'GS', 'wind_speed', 'temperature', 'humidity', 'wind_angle', 'payload']
+        self.feature_scaler = None
+        self.target_scaler = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.feature_names = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
+                             'Temperature', 'Humidity', 'wind_angle']
         self._load_model()
     
     def _load_model(self):
-        """加载训练好的LightGBM模型"""
-        if not LIGHTGBM_AVAILABLE:
-            print("[WARNING] LightGBM不可用")
-            return
-            
-        try:
-            if os.path.exists(self.model_path):
-                self.model = lgb.Booster(model_file=self.model_path)
-                print(f"[OK] 瞬时功率树模型加载成功: {self.model_path}")
-            else:
-                print(f"[WARNING] 模型文件不存在: {self.model_path}")
-        except Exception as e:
-            print(f"[ERROR] 加载树模型失败: {e}")
-    
-    def predict_power(self, height: float, VS: float, GS: float, 
-                     wind_speed: float, temperature: float, humidity: float,
-                     wind_angle: float, payload: float = 0.0) -> float:
-        """预测瞬时功率 [W]"""
-        if self.model is None:
-            # 后备估算
-            return 4500.0 + 50.0 * GS + 100.0 * abs(VS) + 100.0 * payload
-        
-        features = np.array([[height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload]])
-        power = self.model.predict(features)[0]
-        return max(0.0, power)
-    
-    def energy_from_power(self, power: float, duration_seconds: float) -> float:
-        """根据功率和时间计算能耗 [kWh]"""
-        energy_wh = power * (duration_seconds / 3600.0)
-        return energy_wh / 1000.0
-
-
-# ==================== PyTorch深度学习模型 ====================
-
-class DeepPowerModel:
-    """
-    基于PyTorch的瞬时功率预测模型
-    
-    输入: height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload
-    输出: 瞬时功率 [W]
-    """
-    
-    def __init__(self, model_path: str = 'result/power_pytorch_model.pth'):
-        self.model_path = model_path
-        self.model = None
-        self.scaler = None
-        self.feature_names = ['height', 'VS', 'GS', 'wind_speed', 'temperature', 'humidity', 'wind_angle', 'payload']
-        self._load_model()
-    
-    def _load_model(self):
-        """加载训练好的PyTorch模型"""
+        """加载训练好的LSTM Seq2Seq模型"""
         if not PYTORCH_AVAILABLE:
             print("[WARNING] PyTorch不可用")
             return
             
         try:
             if os.path.exists(self.model_path):
-                # 定义网络结构
-                class PowerNet(nn.Module):
-                    def __init__(self, input_size=8, hidden_sizes=[64, 32], dropout_rate=0.1):
-                        super(PowerNet, self).__init__()
-                        layers = []
-                        prev_size = input_size
-                        for i, hidden_size in enumerate(hidden_sizes):
-                            layers.append(nn.Linear(prev_size, hidden_size))
-                            layers.append(nn.ReLU())
-                            if i == 0:
-                                layers.append(nn.Dropout(dropout_rate))
-                            prev_size = hidden_size
-                        layers.append(nn.Linear(prev_size, 1))
-                        layers.append(nn.ReLU())
-                        self.network = nn.Sequential(*layers)
-                    
-                    def forward(self, x):
-                        return self.network(x)
+                # 创建模型结构
+                self.model = LSTMSeq2Seq(
+                    input_size=7,
+                    hidden_size=128,
+                    num_layers=2,
+                    dropout=0.2,
+                    bidirectional=True
+                )
                 
-                self.model = PowerNet(input_size=8)
-                self.model.load_state_dict(torch.load(self.model_path, map_location='cpu'))
+                # 加载模型权重
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.to(self.device)
                 self.model.eval()
-                print(f"[OK] 瞬时功率深度学习模型加载成功: {self.model_path}")
                 
-                # 加载标准化器
-                scaler_path = self.model_path.replace('.pth', '_scaler.pkl')
+                # 加载标准化器（单独的pickle文件）
+                scaler_path = self.model_path.replace('.pth', '_scalers.pkl')
                 if os.path.exists(scaler_path):
                     with open(scaler_path, 'rb') as f:
-                        self.scaler = pickle.load(f)
-                    print(f"[OK] 标准化器加载成功: {scaler_path}")
+                        scalers = pickle.load(f)
+                        self.feature_scaler = scalers.get('feature_scaler')
+                        self.target_scaler = scalers.get('target_scaler')
+                
+                print(f"[OK] LSTM Seq2Seq功率模型加载成功: {self.model_path}")
             else:
                 print(f"[WARNING] 模型文件不存在: {self.model_path}")
         except Exception as e:
-            print(f"[ERROR] 加载深度学习模型失败: {e}")
+            print(f"[ERROR] 加载LSTM模型失败: {e}")
     
-    def predict_power(self, height: float, VS: float, GS: float, 
-                     wind_speed: float, temperature: float, humidity: float,
-                     wind_angle: float, payload: float = 0.0) -> float:
-        """预测瞬时功率 [W]"""
+    def predict_power_sequence(self, feature_sequence: np.ndarray) -> np.ndarray:
+        """
+        预测功率序列
+        
+        参数:
+            feature_sequence: 特征序列 (seq_len, 7)
+            
+        返回:
+            功率序列 (seq_len,) [W]
+        """
         if self.model is None:
-            return 4500.0 + 50.0 * GS + 100.0 * abs(VS) + 100.0 * payload
+            # 后备估算：使用简单公式
+            GS = feature_sequence[:, 2] if feature_sequence.shape[1] > 2 else 10.0
+            VS = feature_sequence[:, 1] if feature_sequence.shape[1] > 1 else 0.0
+            return 4500.0 + 50.0 * GS + 100.0 * np.abs(VS)
         
-        features = np.array([[height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload]])
+        # 标准化输入
+        if self.feature_scaler is not None:
+            feature_sequence = self.feature_scaler.transform(feature_sequence)
         
-        if self.scaler is not None:
-            features = self.scaler.transform(features)
-        
+        # 转换为张量
         with torch.no_grad():
-            input_tensor = torch.FloatTensor(features)
-            power = self.model(input_tensor).item()
+            input_tensor = torch.FloatTensor(feature_sequence).unsqueeze(0).to(self.device)
+            output = self.model(input_tensor)
+            power_sequence = output.squeeze(0).cpu().numpy()
         
-        return max(0.0, power)
-    
-    def energy_from_power(self, power: float, duration_seconds: float) -> float:
-        """根据功率和时间计算能耗 [kWh]"""
-        energy_wh = power * (duration_seconds / 3600.0)
-        return energy_wh / 1000.0
-
-
-# ==================== 线性回归模型 ====================
-
-class LinearPowerModel:
-    """
-    基于线性回归的瞬时功率预测模型
-    
-    输入: height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload
-    输出: 瞬时功率 [W]
-    """
-    
-    def __init__(self, model_path: str = 'result/power_linear_model.pkl'):
-        self.model_path = model_path
-        self.model = None
-        self.feature_names = ['height', 'VS', 'GS', 'wind_speed', 'temperature', 'humidity', 'wind_angle', 'payload']
-        self._load_model()
-    
-    def _load_model(self):
-        """加载训练好的线性回归模型"""
-        try:
-            if os.path.exists(self.model_path):
-                with open(self.model_path, 'rb') as f:
-                    self.model = pickle.load(f)
-                print(f"[OK] 瞬时功率线性回归模型加载成功: {self.model_path}")
-            else:
-                print(f"[WARNING] 模型文件不存在: {self.model_path}")
-        except Exception as e:
-            print(f"[ERROR] 加载线性回归模型失败: {e}")
+        # 反标准化输出
+        if self.target_scaler is not None:
+            power_sequence = self.target_scaler.inverse_transform(
+                power_sequence.reshape(-1, 1)
+            ).flatten()
+        
+        return np.maximum(0.0, power_sequence)
     
     def predict_power(self, height: float, VS: float, GS: float, 
                      wind_speed: float, temperature: float, humidity: float,
-                     wind_angle: float, payload: float = 0.0) -> float:
-        """预测瞬时功率 [W]"""
-        if self.model is None:
-            return 4500.0 + 50.0 * GS + 100.0 * abs(VS) + 100.0 * payload
+                     wind_angle: float) -> float:
+        """
+        预测单个时刻的功率（用于兼容旧接口）
         
-        features = np.array([[height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload]])
-        power = self.model.predict(features)[0]
-        return max(0.0, power)
+        注意: LSTM模型设计用于序列预测，单点预测效果可能不如序列预测
+        """
+        features = np.array([[height, VS, GS, wind_speed, temperature, humidity, wind_angle]])
+        power_seq = self.predict_power_sequence(features)
+        return float(power_seq[0])
     
     def energy_from_power(self, power: float, duration_seconds: float) -> float:
         """根据功率和时间计算能耗 [kWh]"""
         energy_wh = power * (duration_seconds / 3600.0)
         return energy_wh / 1000.0
+    
+    def calculate_sequence_energy(self, power_sequence: np.ndarray, 
+                                  time_interval: float = 1.0) -> float:
+        """
+        根据功率序列计算总能耗
+        
+        参数:
+            power_sequence: 功率序列 [W]
+            time_interval: 采样时间间隔 [秒]
+            
+        返回:
+            总能耗 [kWh]
+        """
+        total_energy_wh = np.sum(power_sequence) * (time_interval / 3600.0)
+        return total_energy_wh / 1000.0
 
 
 # ==================== 模型工厂函数 ====================
 
-def create_power_model(model_type: str = "tree", instance: MTDRPInstance = None):
+def create_power_model(model_type: str = "lstm", instance: 'MTDRPInstance' = None):
     """
     创建瞬时功率预测模型的工厂函数
     
     参数:
-        model_type: 模型类型 ("physical", "tree", "deep", "linear")
-        instance: MTDRP问题实例（仅物理模型需要）
+        model_type: 模型类型 ("lstm")
+        instance: MTDRP问题实例（保留参数，当前未使用）
         
     返回:
         瞬时功率预测模型实例
     """
-    if model_type.lower() == "physical":
-        drone_params = instance.drone_params if instance else DroneParameters()
-        print("[OK] 使用PhysicalPowerModel (基于物理公式)")
-        return PhysicalPowerModel(drone_params)
-    
-    elif model_type.lower() == "tree":
-        print("[OK] 使用TreePowerModel (基于LightGBM)")
-        return TreePowerModel()
-    
-    elif model_type.lower() == "deep":
-        print("[OK] 使用DeepPowerModel (基于PyTorch)")
-        return DeepPowerModel()
-    
-    elif model_type.lower() == "linear":
-        print("[OK] 使用LinearPowerModel (基于线性回归)")
-        return LinearPowerModel()
+    if model_type.lower() == "lstm":
+        print("[OK] 使用LSTMPowerModel (基于LSTM Seq2Seq)")
+        return LSTMPowerModel()
     
     else:
-        raise ValueError(f"不支持的模型类型: {model_type}. 支持: 'physical', 'tree', 'deep', 'linear'")
+        raise ValueError(f"不支持的模型类型: {model_type}. 支持: 'lstm'")
 
 
 # ==================== 能耗计算辅助函数 ====================
 
-def calculate_trip_energy(power_model, trajectory_points: List[Dict], 
+def calculate_trip_energy(power_model: LSTMPowerModel, trajectory_points: List[Dict], 
                          time_interval: float = 1.0) -> float:
     """
-    根据轨迹点序列计算总能耗
+    根据轨迹点序列计算总能耗（利用LSTM序列预测）
     
     参数:
-        power_model: 功率预测模型
+        power_model: LSTM功率预测模型
         trajectory_points: 轨迹点列表，每个点包含 {height, VS, GS, wind_speed, temperature, humidity, wind_angle}
         time_interval: 采样时间间隔 [秒]
         
     返回:
         总能耗 [kWh]
     """
-    total_energy = 0.0
+    if not trajectory_points:
+        return 0.0
     
-    for point in trajectory_points:
-        power = power_model.predict_power(
-            height=point.get('height', 100.0),
-            VS=point.get('VS', 0.0),
-            GS=point.get('GS', 10.0),
-            wind_speed=point.get('wind_speed', 2.0),
-            temperature=point.get('temperature', 25.0),
-            humidity=point.get('humidity', 60.0),
-            wind_angle=point.get('wind_angle', 90.0)
-        )
-        energy = power_model.energy_from_power(power, time_interval)
-        total_energy += energy
+    # 构建特征序列
+    feature_sequence = np.array([
+        [
+            point.get('height', 100.0),
+            point.get('VS', 0.0),
+            point.get('GS', 10.0),
+            point.get('wind_speed', 2.0),
+            point.get('temperature', 25.0),
+            point.get('humidity', 60.0),
+            point.get('wind_angle', 90.0)
+        ]
+        for point in trajectory_points
+    ])
+    
+    # 使用LSTM预测功率序列
+    power_sequence = power_model.predict_power_sequence(feature_sequence)
+    
+    # 计算总能耗
+    total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
     
     return total_energy
 
 
-def estimate_flight_energy(power_model, distance: float, speed: float = 10.0,
+def estimate_flight_energy(power_model: LSTMPowerModel, distance: float, speed: float = 10.0,
                           height: float = 100.0, wind_speed: float = 2.0,
                           temperature: float = 25.0, humidity: float = 60.0,
-                          wind_angle: float = 90.0) -> float:
+                          wind_angle: float = 90.0, time_interval: float = 1.0) -> float:
     """
-    估算一段飞行的能耗（简化版，用于调度规划）
+    估算一段飞行的能耗（基于LSTM序列预测）
     
     参数:
-        power_model: 功率预测模型
+        power_model: LSTM功率预测模型
         distance: 飞行距离 [m]
         speed: 飞行速度 [m/s]
-        其他参数: 环境条件
+        height: 飞行高度 [m]
+        wind_speed: 风速 [m/s]
+        temperature: 温度 [°C]
+        humidity: 湿度 [%]
+        wind_angle: 风向夹角 [度]
+        time_interval: 采样时间间隔 [秒]
         
     返回:
         估算能耗 [kWh]
     """
-    # 计算飞行时间
+    # 计算飞行时间和采样点数
     flight_time = distance / speed  # 秒
+    num_points = max(1, int(flight_time / time_interval))
     
-    # 预测平均功率（假设匀速平飞）
-    avg_power = power_model.predict_power(
-        height=height,
-        VS=0.0,  # 平飞
-        GS=speed,
-        wind_speed=wind_speed,
-        temperature=temperature,
-        humidity=humidity,
-        wind_angle=wind_angle
-    )
+    # 构建特征序列（假设匀速平飞）
+    feature_sequence = np.array([
+        [height, 0.0, speed, wind_speed, temperature, humidity, wind_angle]
+        for _ in range(num_points)
+    ])
     
-    # 计算能耗
-    energy = power_model.energy_from_power(avg_power, flight_time)
+    # 使用LSTM预测功率序列
+    power_sequence = power_model.predict_power_sequence(feature_sequence)
     
-    return energy
+    # 计算总能耗
+    total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
+    
+    return total_energy
+
+
+def predict_flight_plan_energy(power_model: LSTMPowerModel, 
+                               flight_plan: List[Dict],
+                               time_interval: float = 1.0) -> Tuple[np.ndarray, float]:
+    """
+    根据预设飞行计划预测功率序列和总能耗
+    
+    参数:
+        power_model: LSTM功率预测模型
+        flight_plan: 飞行计划列表，每个点包含:
+            - height: 高度 [m]
+            - VS: 竖直速度 [m/s]
+            - GS: 地速 [m/s]
+            - wind_speed: 风速 [m/s]
+            - temperature: 温度 [°C]
+            - humidity: 湿度 [%]
+            - wind_angle: 风向夹角 [度]
+        time_interval: 采样时间间隔 [秒]
+        
+    返回:
+        (power_sequence, total_energy): 功率序列 [W] 和总能耗 [kWh]
+    """
+    if not flight_plan:
+        return np.array([]), 0.0
+    
+    # 构建特征序列
+    feature_sequence = np.array([
+        [
+            point.get('height', 100.0),
+            point.get('VS', 0.0),
+            point.get('GS', 10.0),
+            point.get('wind_speed', 2.0),
+            point.get('temperature', 25.0),
+            point.get('humidity', 60.0),
+            point.get('wind_angle', 90.0)
+        ]
+        for point in flight_plan
+    ])
+    
+    # 使用LSTM预测功率序列
+    power_sequence = power_model.predict_power_sequence(feature_sequence)
+    
+    # 计算总能耗
+    total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
+    
+    return power_sequence, total_energy
