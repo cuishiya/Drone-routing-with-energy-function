@@ -2,23 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-多行程无人机路径问题 (MTDRP) - LSTM Seq2Seq 瞬时功率预测模型
+多行程无人机路径问题 (MTDRP) - 时序功率预测模型
 
 基于论文: "Drone routing with energy function: Formulation and exact algorithm"
 
 核心特点:
-1. 瞬时功率预测: 基于LSTM Seq2Seq模型利用时序特征预测功率序列
+1. 瞬时功率预测: 基于深度学习模型利用时序特征预测功率序列
 2. 多行程支持: 无人机可返回配送中心换电池后继续执行任务
 3. 时间窗约束: 每个客户有到达时间窗 [a_i, b_i]
 4. 载重约束: 无人机最大载重限制 Q
 
+支持的模型类型 (按性能排序):
+- bilstm: 双向LSTM模型 (推荐，R²=0.8287)
+- gru: GRU Seq2Seq模型 (R²=0.8247)
+- lstm: LSTM Seq2Seq模型 (R²=0.8155)
+- transformer: Transformer模型 (R²=0.8104)
+
 模型输入特征序列 (每个时刻7个特征):
-- height: 高度 [m]
+- Height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
-- wind_speed: 风速 [m/s]
-- temperature: 温度 [°C]
-- humidity: 湿度 [%]
+- Wind Speed: 风速 [m/s]
+- Temperature: 温度 [°C]
+- Humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
 
 模型输出: 瞬时功率序列 [W]
@@ -37,14 +43,18 @@ import pickle
 try:
     import torch
     import torch.nn as nn
+    import warnings
+    import math
     PYTORCH_AVAILABLE = True
+    # 禁用 cuDNN RNN 内存警告
+    warnings.filterwarnings('ignore', message='RNN module weights are not part of single contiguous chunk of memory')
 except ImportError:
-    print("[WARNING] PyTorch未安装，LSTM模型将不可用")
+    print("[WARNING] PyTorch未安装，深度学习模型将不可用")
     PYTORCH_AVAILABLE = False
 
 
 # ==================== 全局参数配置 ====================
-NUM_DRONES: int = 12  # 无人机数量
+NUM_DRONES: int = 5  # 无人机数量
 
 
 @dataclass
@@ -272,17 +282,196 @@ class LSTMSeq2Seq(nn.Module):
         return outputs
 
 
-# ==================== LSTM Seq2Seq 功率预测模型 ====================
+# ==================== GRU Seq2Seq 模型定义 ====================
 
-class LSTMPowerModel:
-    """
-    基于LSTM Seq2Seq的瞬时功率预测模型
+class GRUEncoder(nn.Module):
+    """GRU编码器"""
+    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
+        super(GRUEncoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
     
-    输入: 特征序列 (seq_len, 7) - height, VS, GS, wind_speed, temperature, humidity, wind_angle
-    输出: 功率序列 (seq_len,) [W]
-    """
+    def forward(self, x):
+        outputs, hidden = self.gru(x)
+        return outputs, hidden
+
+
+class GRUDecoder(nn.Module):
+    """GRU解码器"""
+    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
+        super(GRUDecoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_directions = 2 if bidirectional else 1
+        
+        decoder_input_size = hidden_size * self.num_directions
+        
+        self.gru = nn.GRU(
+            input_size=decoder_input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
     
-    def __init__(self, model_path: str = 'result/power_lstm_seq2seq_model.pth'):
+    def forward(self, encoder_outputs, hidden):
+        decoder_outputs, _ = self.gru(encoder_outputs, hidden)
+        outputs = self.fc(decoder_outputs)
+        return outputs.squeeze(-1)
+
+
+class GRUSeq2Seq(nn.Module):
+    """GRU Seq2Seq 完整模型"""
+    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
+                 dropout=0.2, bidirectional=True):
+        super(GRUSeq2Seq, self).__init__()
+        
+        self.encoder = GRUEncoder(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+        
+        self.decoder = GRUDecoder(
+            hidden_size=hidden_size,
+            output_size=1,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional
+        )
+    
+    def forward(self, x):
+        encoder_outputs, hidden = self.encoder(x)
+        outputs = self.decoder(encoder_outputs, hidden)
+        return outputs
+
+
+# ==================== Bi-LSTM 模型定义 ====================
+
+class BiLSTMModel(nn.Module):
+    """双向LSTM功率预测模型"""
+    def __init__(self, input_size=7, hidden_size=128, num_layers=3, dropout=0.3):
+        super(BiLSTMModel, self).__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # 双向LSTM层
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=True
+        )
+        
+        # 注意力机制
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 输出层
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1)
+        )
+    
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        output = self.fc(lstm_out)
+        return output.squeeze(-1)
+
+
+# ==================== Transformer 模型定义 ====================
+
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class TransformerModel(nn.Module):
+    """Transformer功率预测模型"""
+    def __init__(self, input_size=7, d_model=128, nhead=8, num_layers=4, 
+                 dim_feedforward=512, dropout=0.1, max_len=500):
+        super(TransformerModel, self).__init__()
+        
+        self.d_model = d_model
+        
+        # 输入嵌入层
+        self.input_embedding = nn.Linear(input_size, d_model)
+        
+        # 位置编码
+        self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
+        
+        # Transformer编码器层
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1)
+        )
+    
+    def forward(self, x, src_key_padding_mask=None):
+        x = self.input_embedding(x) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+        output = self.output_layer(x)
+        return output.squeeze(-1)
+
+
+# ==================== 功率预测模型基类 ====================
+
+class BasePowerModel:
+    """功率预测模型基类"""
+    
+    def __init__(self, model_path: str):
         self.model_path = model_path
         self.model = None
         self.feature_scaler = None
@@ -290,6 +479,190 @@ class LSTMPowerModel:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.feature_names = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
                              'Temperature', 'Humidity', 'wind_angle']
+    
+    def _load_scalers(self):
+        """加载标准化器"""
+        scaler_path = self.model_path.replace('.pth', '_scalers.pkl')
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                scalers = pickle.load(f)
+                self.feature_scaler = scalers.get('feature_scaler')
+                self.target_scaler = scalers.get('target_scaler')
+    
+    def predict_power_sequence(self, feature_sequence: np.ndarray) -> np.ndarray:
+        """
+        预测功率序列
+        
+        参数:
+            feature_sequence: N×7 特征矩阵 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle]
+            
+        返回:
+            N维功率序列 [W]
+        """
+        if self.feature_scaler is not None:
+            feature_sequence = self.feature_scaler.transform(feature_sequence)
+        
+        with torch.no_grad():
+            input_tensor = torch.FloatTensor(feature_sequence).unsqueeze(0).to(self.device)
+            output = self.model(input_tensor)
+            power_sequence = output.squeeze(0).cpu().numpy()
+        
+        if self.target_scaler is not None:
+            power_sequence = self.target_scaler.inverse_transform(
+                power_sequence.reshape(-1, 1)
+            ).flatten()
+        
+        return np.maximum(0.0, power_sequence)
+    
+    def generate_arc_trajectory(self, distance: float, 
+                                cruise_height: float = 120.0,
+                                cruise_speed: float = 10.0,
+                                vertical_speed: float = 3.0,
+                                wind_speed: float = 2.0,
+                                temperature: float = 25.0,
+                                humidity: float = 60.0,
+                                wind_angle: float = 90.0,
+                                time_interval: float = 1.0) -> np.ndarray:
+        """
+        生成弧航迹的特征序列
+        
+        航迹模式: 垂直上升 → 水平巡航 → 垂直下降
+        
+        阶段1 - 垂直上升:
+            - Height: 0 → cruise_height (线性增加)
+            - VS: +vertical_speed (正值表示上升)
+            - GS: 0 (无水平移动)
+            
+        阶段2 - 水平巡航:
+            - Height: cruise_height (恒定)
+            - VS: 0
+            - GS: cruise_speed
+            
+        阶段3 - 垂直下降:
+            - Height: cruise_height → 0 (线性减少)
+            - VS: -vertical_speed (负值表示下降)
+            - GS: 0 (无水平移动)
+        
+        参数:
+            distance: 水平飞行距离 [m]
+            cruise_height: 巡航高度 [m]
+            cruise_speed: 巡航速度 [m/s]
+            vertical_speed: 垂直速度 [m/s]
+            wind_speed: 风速 [m/s]
+            temperature: 温度 [°C]
+            humidity: 湿度 [%]
+            wind_angle: 风向夹角 [度]
+            time_interval: 采样间隔 [秒]
+            
+        返回:
+            N×7 特征矩阵，每行 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle]
+        """
+        trajectory_points = []
+        
+        # 阶段1: 垂直上升
+        climb_time = cruise_height / vertical_speed  # 上升所需时间 [秒]
+        climb_steps = max(1, int(climb_time / time_interval))
+        for i in range(climb_steps):
+            t = i * time_interval
+            height = min(cruise_height, t * vertical_speed)
+            trajectory_points.append([
+                height,           # Height
+                vertical_speed,   # VS (正值=上升)
+                0.0,              # GS (无水平移动)
+                wind_speed,
+                temperature,
+                humidity,
+                wind_angle
+            ])
+        
+        # 阶段2: 水平巡航
+        cruise_time = distance / cruise_speed  # 巡航所需时间 [秒]
+        cruise_steps = max(1, int(cruise_time / time_interval))
+        for i in range(cruise_steps):
+            trajectory_points.append([
+                cruise_height,    # Height (恒定)
+                0.0,              # VS (无垂直移动)
+                cruise_speed,     # GS
+                wind_speed,
+                temperature,
+                humidity,
+                wind_angle
+            ])
+        
+        # 阶段3: 垂直下降
+        descent_time = cruise_height / vertical_speed  # 下降所需时间 [秒]
+        descent_steps = max(1, int(descent_time / time_interval))
+        for i in range(descent_steps):
+            t = i * time_interval
+            height = max(0.0, cruise_height - t * vertical_speed)
+            trajectory_points.append([
+                height,            # Height
+                -vertical_speed,   # VS (负值=下降)
+                0.0,               # GS (无水平移动)
+                wind_speed,
+                temperature,
+                humidity,
+                wind_angle
+            ])
+        
+        return np.array(trajectory_points)
+    
+    def predict_arc_energy(self, distance: float,
+                          cruise_height: float = 120.0,
+                          cruise_speed: float = 10.0,
+                          vertical_speed: float = 3.0,
+                          wind_speed: float = 2.0,
+                          temperature: float = 25.0,
+                          humidity: float = 60.0,
+                          wind_angle: float = 90.0,
+                          time_interval: float = 1.0) -> Tuple[float, float]:
+        """
+        预测一条弧的总能耗
+        
+        参数:
+            distance: 水平飞行距离 [m]
+            其他参数同 generate_arc_trajectory
+            
+        返回:
+            (energy_kwh, total_time_seconds): 总能耗[kWh], 总飞行时间[秒]
+        """
+        # 生成航迹特征序列
+        trajectory = self.generate_arc_trajectory(
+            distance=distance,
+            cruise_height=cruise_height,
+            cruise_speed=cruise_speed,
+            vertical_speed=vertical_speed,
+            wind_speed=wind_speed,
+            temperature=temperature,
+            humidity=humidity,
+            wind_angle=wind_angle,
+            time_interval=time_interval
+        )
+        
+        # 预测功率序列
+        power_sequence = self.predict_power_sequence(trajectory)
+        
+        # 计算总能耗: E = Σ(P_i * Δt) / 3600 / 1000 [kWh]
+        total_time_seconds = len(power_sequence) * time_interval
+        total_energy_wh = np.sum(power_sequence) * time_interval / 3600.0
+        energy_kwh = total_energy_wh / 1000.0
+        
+        return energy_kwh, total_time_seconds
+    
+    def calculate_sequence_energy(self, power_sequence: np.ndarray, 
+                                  time_interval: float = 1.0) -> float:
+        """根据功率序列计算总能耗 [kWh]"""
+        total_energy_wh = np.sum(power_sequence) * (time_interval / 3600.0)
+        return total_energy_wh / 1000.0
+
+
+# ==================== LSTM Seq2Seq 功率预测模型 ====================
+
+class LSTMPowerModel(BasePowerModel):
+    """基于LSTM Seq2Seq的瞬时功率预测模型"""
+    
+    def __init__(self, model_path: str = 'result/power_lstm_seq2seq_model.pth'):
+        super().__init__(model_path)
         self._load_model()
     
     def _load_model(self):
@@ -300,121 +673,233 @@ class LSTMPowerModel:
             
         try:
             if os.path.exists(self.model_path):
-                # 创建模型结构
+                # 统一参数配置（与训练脚本保持一致）
                 self.model = LSTMSeq2Seq(
                     input_size=7,
-                    hidden_size=128,
-                    num_layers=2,
+                    hidden_size=256,     # 统一为256
+                    num_layers=3,        # 统一为3
                     dropout=0.2,
                     bidirectional=True
                 )
                 
-                # 加载模型权重
                 checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.model.to(self.device)
                 self.model.eval()
                 
-                # 加载标准化器（单独的pickle文件）
-                scaler_path = self.model_path.replace('.pth', '_scalers.pkl')
-                if os.path.exists(scaler_path):
-                    with open(scaler_path, 'rb') as f:
-                        scalers = pickle.load(f)
-                        self.feature_scaler = scalers.get('feature_scaler')
-                        self.target_scaler = scalers.get('target_scaler')
+                # 消除 cuDNN 内存警告
+                self.model.encoder.lstm.flatten_parameters()
+                self.model.decoder.lstm.flatten_parameters()
                 
+                self._load_scalers()
                 print(f"[OK] LSTM Seq2Seq功率模型加载成功: {self.model_path}")
             else:
                 print(f"[WARNING] 模型文件不存在: {self.model_path}")
         except Exception as e:
             print(f"[ERROR] 加载LSTM模型失败: {e}")
+
+
+# ==================== GRU Seq2Seq 功率预测模型 ====================
+
+class GRUPowerModel(BasePowerModel):
+    """基于GRU Seq2Seq的瞬时功率预测模型"""
     
-    def predict_power_sequence(self, feature_sequence: np.ndarray) -> np.ndarray:
-        """
-        预测功率序列
-        
-        参数:
-            feature_sequence: 特征序列 (seq_len, 7)
+    def __init__(self, model_path: str = 'result/power_gru_model.pth'):
+        super().__init__(model_path)
+        self._load_model()
+    
+    def _load_model(self):
+        """加载训练好的GRU Seq2Seq模型"""
+        if not PYTORCH_AVAILABLE:
+            print("[WARNING] PyTorch不可用")
+            return
             
-        返回:
-            功率序列 (seq_len,) [W]
-        """
-        if self.model is None:
-            # 后备估算：使用简单公式
-            GS = feature_sequence[:, 2] if feature_sequence.shape[1] > 2 else 10.0
-            VS = feature_sequence[:, 1] if feature_sequence.shape[1] > 1 else 0.0
-            return 4500.0 + 50.0 * GS + 100.0 * np.abs(VS)
-        
-        # 标准化输入
-        if self.feature_scaler is not None:
-            feature_sequence = self.feature_scaler.transform(feature_sequence)
-        
-        # 转换为张量
-        with torch.no_grad():
-            input_tensor = torch.FloatTensor(feature_sequence).unsqueeze(0).to(self.device)
-            output = self.model(input_tensor)
-            power_sequence = output.squeeze(0).cpu().numpy()
-        
-        # 反标准化输出
-        if self.target_scaler is not None:
-            power_sequence = self.target_scaler.inverse_transform(
-                power_sequence.reshape(-1, 1)
-            ).flatten()
-        
-        return np.maximum(0.0, power_sequence)
+        try:
+            if os.path.exists(self.model_path):
+                # 统一参数配置（与训练脚本保持一致）
+                self.model = GRUSeq2Seq(
+                    input_size=7,
+                    hidden_size=256,     # 统一为256
+                    num_layers=3,        # 统一为3
+                    dropout=0.2,
+                    bidirectional=True
+                )
+                
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.to(self.device)
+                self.model.eval()
+                
+                # 消除 cuDNN 内存警告
+                self.model.encoder.gru.flatten_parameters()
+                self.model.decoder.gru.flatten_parameters()
+                
+                self._load_scalers()
+                print(f"[OK] GRU Seq2Seq功率模型加载成功: {self.model_path}")
+            else:
+                print(f"[WARNING] 模型文件不存在: {self.model_path}")
+        except Exception as e:
+            print(f"[ERROR] 加载GRU模型失败: {e}")
+
+
+# ==================== Bi-LSTM 功率预测模型 ====================
+
+class BiLSTMPowerModel(BasePowerModel):
+    """基于Bi-LSTM的瞬时功率预测模型"""
     
-    def predict_power(self, height: float, VS: float, GS: float, 
-                     wind_speed: float, temperature: float, humidity: float,
-                     wind_angle: float) -> float:
-        """
-        预测单个时刻的功率（用于兼容旧接口）
-        
-        注意: LSTM模型设计用于序列预测，单点预测效果可能不如序列预测
-        """
-        features = np.array([[height, VS, GS, wind_speed, temperature, humidity, wind_angle]])
-        power_seq = self.predict_power_sequence(features)
-        return float(power_seq[0])
+    def __init__(self, model_path: str = 'result/power_bilstm_v2_model.pth'):
+        super().__init__(model_path)
+        self._load_model()
     
-    def energy_from_power(self, power: float, duration_seconds: float) -> float:
-        """根据功率和时间计算能耗 [kWh]"""
-        energy_wh = power * (duration_seconds / 3600.0)
-        return energy_wh / 1000.0
-    
-    def calculate_sequence_energy(self, power_sequence: np.ndarray, 
-                                  time_interval: float = 1.0) -> float:
-        """
-        根据功率序列计算总能耗
-        
-        参数:
-            power_sequence: 功率序列 [W]
-            time_interval: 采样时间间隔 [秒]
+    def _load_model(self):
+        """加载训练好的Bi-LSTM模型"""
+        if not PYTORCH_AVAILABLE:
+            print("[WARNING] PyTorch不可用")
+            return
             
-        返回:
-            总能耗 [kWh]
-        """
-        total_energy_wh = np.sum(power_sequence) * (time_interval / 3600.0)
-        return total_energy_wh / 1000.0
+        try:
+            if os.path.exists(self.model_path):
+                # 统一参数配置（与训练脚本保持一致）
+                self.model = BiLSTMModel(
+                    input_size=7,
+                    hidden_size=256,     # 统一为256
+                    num_layers=3,
+                    dropout=0.2          # 统一为0.2
+                )
+                
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.to(self.device)
+                self.model.eval()
+                
+                # 消除 cuDNN 内存警告
+                self.model.lstm.flatten_parameters()
+                
+                self._load_scalers()
+                print(f"[OK] Bi-LSTM功率模型加载成功: {self.model_path}")
+            else:
+                print(f"[WARNING] 模型文件不存在: {self.model_path}")
+        except Exception as e:
+            print(f"[ERROR] 加载Bi-LSTM模型失败: {e}")
+
+
+# ==================== Transformer 功率预测模型 ====================
+
+class TransformerPowerModel(BasePowerModel):
+    """基于Transformer的瞬时功率预测模型"""
+    
+    def __init__(self, model_path: str = 'result/power_transformer_model.pth'):
+        super().__init__(model_path)
+        self._load_model()
+    
+    def _load_model(self):
+        """加载训练好的Transformer模型"""
+        if not PYTORCH_AVAILABLE:
+            print("[WARNING] PyTorch不可用")
+            return
+            
+        try:
+            if os.path.exists(self.model_path):
+                # 统一参数配置（与训练脚本保持一致）
+                self.model = TransformerModel(
+                    input_size=7,
+                    d_model=256,         # 统一为256
+                    nhead=8,
+                    num_layers=3,        # 统一为3
+                    dim_feedforward=1024,# 4倍d_model
+                    dropout=0.2,         # 统一为0.2
+                    max_len=500
+                )
+                
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.to(self.device)
+                self.model.eval()
+                
+                self._load_scalers()
+                print(f"[OK] Transformer功率模型加载成功: {self.model_path}")
+            else:
+                print(f"[WARNING] 模型文件不存在: {self.model_path}")
+        except Exception as e:
+            print(f"[ERROR] 加载Transformer模型失败: {e}")
 
 
 # ==================== 模型工厂函数 ====================
 
-def create_power_model(model_type: str = "lstm", instance: 'MTDRPInstance' = None):
+# 模型配置信息
+MODEL_CONFIGS = {
+    'lstm': {
+        'name': 'LSTM Seq2Seq',
+        'class': 'LSTMPowerModel',
+        'path': 'result/power_lstm_seq2seq_model.pth',
+        'r2': 0.8155,
+        'description': '编码器-解码器结构的LSTM模型'
+    },
+    'gru': {
+        'name': 'GRU Seq2Seq',
+        'class': 'GRUPowerModel',
+        'path': 'result/power_gru_model.pth',
+        'r2': 0.8247,
+        'description': '编码器-解码器结构的GRU模型'
+    },
+    'bilstm': {
+        'name': 'Bi-LSTM',
+        'class': 'BiLSTMPowerModel',
+        'path': 'result/power_bilstm_v2_model.pth',
+        'r2': 0.8287,
+        'description': '双向LSTM模型（推荐）'
+    },
+    'transformer': {
+        'name': 'Transformer',
+        'class': 'TransformerPowerModel',
+        'path': 'result/power_transformer_model.pth',
+        'r2': 0.8104,
+        'description': '基于自注意力机制的Transformer模型'
+    }
+}
+
+
+def create_power_model(model_type: str = "bilstm", instance: 'MTDRPInstance' = None):
     """
     创建瞬时功率预测模型的工厂函数
     
     参数:
-        model_type: 模型类型 ("lstm")
+        model_type: 模型类型 ("lstm", "gru", "bilstm", "transformer")
+                   默认使用 bilstm（性能最佳）
         instance: MTDRP问题实例（保留参数，当前未使用）
         
     返回:
         瞬时功率预测模型实例
+        
+    模型性能对比 (test_data测试集):
+        | 模型        | R²     | RMSE (W) | MAE (W) |
+        |-------------|--------|----------|---------|
+        | Bi-LSTM     | 0.8287 | 397.78   | 291.08  |
+        | GRU         | 0.8247 | 402.50   | 295.57  |
+        | LSTM        | 0.8155 | 412.86   | 305.24  |
+        | Transformer | 0.8104 | 418.51   | 292.74  |
     """
-    if model_type.lower() == "lstm":
-        print("[OK] 使用LSTMPowerModel (基于LSTM Seq2Seq)")
+    model_type = model_type.lower()
+    
+    if model_type == "lstm":
+        print("[OK] 使用 LSTM Seq2Seq 功率预测模型 (R^2=0.8155)")
         return LSTMPowerModel()
     
+    elif model_type == "gru":
+        print("[OK] 使用 GRU Seq2Seq 功率预测模型 (R^2=0.8247)")
+        return GRUPowerModel()
+    
+    elif model_type == "bilstm":
+        print("[OK] 使用 Bi-LSTM 功率预测模型 (推荐, R^2=0.8287)")
+        return BiLSTMPowerModel()
+    
+    elif model_type == "transformer":
+        print("[OK] 使用 Transformer 功率预测模型 (R^2=0.8104)")
+        return TransformerPowerModel()
+    
     else:
-        raise ValueError(f"不支持的模型类型: {model_type}. 支持: 'lstm'")
+        supported = list(MODEL_CONFIGS.keys())
+        raise ValueError(f"不支持的模型类型: {model_type}. 支持: {supported}")
 
 
 # ==================== 能耗计算辅助函数 ====================

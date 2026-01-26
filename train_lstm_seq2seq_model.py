@@ -688,11 +688,12 @@ def main():
     )
     
     # ===== 2. 创建模型 =====
+    # 统一参数配置（与GRU/Bi-LSTM/Transformer保持一致以便公平对比）
     model = LSTMSeq2Seq(
         input_size=7,        # 7个输入特征
-        hidden_size=128,     # 隐藏层大小
-        num_layers=2,        # LSTM层数
-        dropout=0.2,         # Dropout比例
+        hidden_size=256,     # 隐藏层大小（统一为256）
+        num_layers=3,        # LSTM层数（统一为3）
+        dropout=0.2,         # Dropout比例（统一为0.2）
         bidirectional=True   # 双向LSTM
     )
     
@@ -709,12 +710,13 @@ def main():
         target_scaler=processor.target_scaler
     )
     
+    # 统一训练参数
     best_loss = trainer.train(
         train_loader=train_loader,
         val_loader=test_loader,
-        epochs=100,
-        lr=0.001,
-        patience=15,
+        epochs=100,          # 统一为100轮
+        lr=0.001,            # 统一学习率
+        patience=20,         # 统一早停耐心值
         save_path='result/power_lstm_seq2seq_model.pth'
     )
     
