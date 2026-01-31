@@ -552,8 +552,8 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
         ax_power.text(0.05, 0.95, textstr, transform=ax_power.transAxes, fontsize=9,
                      verticalalignment='top', horizontalalignment='left', bbox=props)
         
-        ax_power.set_xlabel('Actual Power (W)', fontsize=10)
-        ax_power.set_ylabel('Predicted Power (W)', fontsize=10)
+        ax_power.set_xlabel('实际功率 (W)', fontsize=10)
+        ax_power.set_ylabel('预测功率 (W)', fontsize=10)
         ax_power.set_title(f'({chr(97+idx)}) {model_name}', fontsize=11, fontweight='bold')
         ax_power.grid(True, alpha=0.3)
         
@@ -590,8 +590,8 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
         ax_energy.text(0.05, 0.95, textstr, transform=ax_energy.transAxes, fontsize=9,
                       verticalalignment='top', horizontalalignment='left', bbox=props)
         
-        ax_energy.set_xlabel('Actual Energy (Wh)', fontsize=10)
-        ax_energy.set_ylabel('Predicted Energy (Wh)', fontsize=10)
+        ax_energy.set_xlabel('实际能耗 (Wh)', fontsize=10)
+        ax_energy.set_ylabel('预测能耗 (Wh)', fontsize=10)
         ax_energy.set_title(f'({chr(101+idx)})', fontsize=11, fontweight='bold')
         ax_energy.grid(True, alpha=0.3)
     
@@ -648,8 +648,8 @@ def plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3, sav
             
             color = colors.get(model_name, '#4A90D9')
             
-            ax.plot(time_axis, true_power, 'k-', label='Actual', linewidth=1.2, alpha=0.8)
-            ax.plot(time_axis, pred_power, color=color, linestyle='--', label='Predicted', linewidth=1.2, alpha=0.8)
+            ax.plot(time_axis, true_power, 'k-', label='实际值', linewidth=1.2, alpha=0.8)
+            ax.plot(time_axis, pred_power, color=color, linestyle='--', label='预测值', linewidth=1.2, alpha=0.8)
             ax.fill_between(time_axis, true_power, pred_power, alpha=0.15, color=color)
             
             # 添加指标
@@ -658,14 +658,14 @@ def plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3, sav
             ax.text(0.98, 0.98, textstr, transform=ax.transAxes, fontsize=9,
                    verticalalignment='top', horizontalalignment='right', bbox=props)
             
-            ax.set_xlabel('Time (s)', fontsize=10)
-            ax.set_ylabel('Power (W)', fontsize=10)
+            ax.set_xlabel('时间 (s)', fontsize=10)
+            ax.set_ylabel('功率 (W)', fontsize=10)
             
             if row == 0:
                 ax.set_title(f'{model_name}', fontsize=11, fontweight='bold')
             
             if col == 0:
-                ax.text(-0.15, 0.5, f'Flight {row+1}\n({len(true_power)}s)', 
+                ax.text(-0.15, 0.5, f'航次 {row+1}\n({len(true_power)}s)', 
                        transform=ax.transAxes, fontsize=10, verticalalignment='center',
                        horizontalalignment='right', fontweight='bold')
             
