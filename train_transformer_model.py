@@ -70,8 +70,8 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
     """Transformer功率预测模型"""
-    def __init__(self, input_size=7, d_model=128, nhead=8, num_layers=4, 
-                 dim_feedforward=512, dropout=0.1, max_len=500):
+    def __init__(self, input_size, d_model, nhead, num_layers, 
+                 dim_feedforward, dropout, max_len):
         super(TransformerModel, self).__init__()
         
         self.d_model = d_model
