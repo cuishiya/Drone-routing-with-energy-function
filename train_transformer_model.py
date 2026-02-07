@@ -6,7 +6,7 @@
 
 Transformer使用自注意力机制，能够捕获序列中任意位置之间的依赖关系。
 
-输入特征序列 (每个时刻7个特征):
+输入特征序列 (每个时刻8个特征):
 - height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -14,6 +14,7 @@ Transformer使用自注意力机制，能够捕获序列中任意位置之间的
 - temperature: 温度 [°C]
 - humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+- payload: 载荷 [kg]
 
 输出序列:
 - 瞬时功率序列 [W]
@@ -165,20 +166,40 @@ class DataProcessor:
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.feature_cols = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                            'Temperature', 'Humidity', 'wind_angle']
+                            'Temperature', 'Humidity', 'wind_angle', 'payload']
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
     
     def load_data(self, data_dirs):
-        """加载数据"""
+        """加载数据（包含载荷信息）"""
         all_data = []
         for data_dir in data_dirs:
             trajectory_path = os.path.join(data_dir, "flightTrajectory.xlsx")
+            record_path = os.path.join(data_dir, "flightRecord.xlsx")
+            
             if os.path.exists(trajectory_path):
-                print(f"[INFO] 加载: {trajectory_path}")
+                print(f"[INFO] 加载轨迹数据: {trajectory_path}")
                 df = pd.read_excel(trajectory_path)
                 n_orders = df['Order ID'].nunique()
                 print(f"  - 数据量: {len(df)} 条记录, {n_orders} 个航次")
+                
+                # 加载飞行记录以获取载荷信息
+                if os.path.exists(record_path):
+                    print(f"[INFO] 加载飞行记录: {record_path}")
+                    record_df = pd.read_excel(record_path)
+                    
+                    # 通过Order ID关联载荷信息
+                    if 'Payload (kg)' in record_df.columns:
+                        payload_map = record_df.set_index('Order ID')['Payload (kg)'].to_dict()
+                        df['payload'] = df['Order ID'].map(payload_map)
+                        print(f"  - 成功关联载荷信息，有效载荷数据: {df['payload'].notna().sum()} 条")
+                    else:
+                        print(f"  - 警告: 飞行记录中没有Payload (kg)列")
+                        df['payload'] = 0.0
+                else:
+                    print(f"  - 警告: 未找到飞行记录文件，载荷设为0")
+                    df['payload'] = 0.0
+                
                 all_data.append(df)
         
         combined_df = pd.concat(all_data, ignore_index=True)
@@ -196,6 +217,13 @@ class DataProcessor:
         # 计算风向夹角
         df['wind_angle'] = np.abs(df['Wind Direct'] - df['Course'])
         df['wind_angle'] = df['wind_angle'].apply(lambda x: x if x <= 180 else 360 - x)
+        
+        # 处理载荷缺失值（用0填充，表示空载）
+        if 'payload' in df.columns:
+            payload_missing = df['payload'].isna().sum()
+            if payload_missing > 0:
+                print(f"[INFO] 载荷缺失值: {payload_missing} 条，用0填充")
+                df['payload'] = df['payload'].fillna(0.0)
         
         # 处理缺失值
         df = df.dropna(subset=self.feature_cols + ['Power'])
@@ -475,7 +503,7 @@ def main():
     # Transformer的d_model=256对应RNN的hidden_size=256
     # num_layers=3对应RNN的num_layers=3
     model = TransformerModel(
-        input_size=7,
+        input_size=8,  # 添加载荷特征，从7个增加到8个
         d_model=256,         # 模型维度（统一为256，对应RNN的hidden_size）
         nhead=8,             # 注意力头数
         num_layers=3,        # 编码器层数（统一为3）

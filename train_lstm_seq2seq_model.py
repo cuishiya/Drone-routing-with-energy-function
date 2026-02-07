@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-基于LSTM的Seq2Seq瞬时功率预测模型
+标准LSTM瞬时功率预测模型
 
 利用飞行轨迹数据的时序特征，通过LSTM网络进行序列到序列的功率预测。
 
-输入特征序列 (每个时刻7个特征):
+输入特征序列 (每个时刻8个特征):
 - height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -14,13 +14,14 @@
 - temperature: 温度 [°C]
 - humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+- payload: 载荷 [kg]
 
 输出序列:
 - 瞬时功率序列 [W]
 
-模型架构: Encoder-Decoder LSTM (Seq2Seq)
-- Encoder: 编码输入序列的时序特征
-- Decoder: 解码生成输出功率序列
+模型架构: 标准LSTM
+- LSTM层: 提取时序特征
+- 全连接层: 输出功率预测
 """
 
 import pandas as pd
@@ -98,98 +99,33 @@ def collate_fn(batch):
     return padded_sequences, padded_targets, lengths
 
 
-# ==================== LSTM Seq2Seq 模型 ====================
+# ==================== 标准 LSTM 模型 ====================
 
-class LSTMEncoder(nn.Module):
-    """LSTM编码器"""
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMEncoder, self).__init__()
+class LSTMModel(nn.Module):
+    """
+    标准LSTM功率预测模型
+    
+    结构: LSTM层 -> 全连接层
+    输入: (batch_size, seq_len, input_size)
+    输出: (batch_size, seq_len) 每个时刻的功率预测
+    """
+    def __init__(self, input_size=8, hidden_size=128, num_layers=2, dropout=0.2):
+        super(LSTMModel, self).__init__()
+        
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
         
+        # LSTM层
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        """
-        Args:
-            x: (batch_size, seq_len, input_size)
-        Returns:
-            outputs: (batch_size, seq_len, hidden_size * num_directions)
-            hidden: (num_layers * num_directions, batch_size, hidden_size)
-            cell: (num_layers * num_directions, batch_size, hidden_size)
-        """
-        outputs, (hidden, cell) = self.lstm(x)
-        return outputs, hidden, cell
-
-
-class LSTMDecoder(nn.Module):
-    """LSTM解码器"""
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMDecoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_directions = 2 if bidirectional else 1
-        
-        # 解码器输入维度 = 编码器输出维度
-        decoder_input_size = hidden_size * self.num_directions
-        
-        self.lstm = nn.LSTM(
-            input_size=decoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
+            dropout=dropout if num_layers > 1 else 0
         )
         
-        # 输出层
-        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden, cell):
-        """
-        Args:
-            encoder_outputs: (batch_size, seq_len, hidden_size * num_directions)
-            hidden: 编码器最终隐藏状态
-            cell: 编码器最终细胞状态
-        Returns:
-            outputs: (batch_size, seq_len, output_size)
-        """
-        # 使用编码器输出作为解码器输入
-        decoder_outputs, _ = self.lstm(encoder_outputs, (hidden, cell))
-        outputs = self.fc(decoder_outputs)
-        return outputs.squeeze(-1)  # (batch_size, seq_len)
-
-
-class LSTMSeq2Seq(nn.Module):
-    """LSTM Seq2Seq 完整模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
-                 dropout=0.2, bidirectional=True):
-        super(LSTMSeq2Seq, self).__init__()
-        
-        self.encoder = LSTMEncoder(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-        
-        self.decoder = LSTMDecoder(
-            hidden_size=hidden_size,
-            output_size=1,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
+        # 全连接输出层
+        self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
         """
@@ -198,9 +134,11 @@ class LSTMSeq2Seq(nn.Module):
         Returns:
             outputs: (batch_size, seq_len) - 预测的功率序列
         """
-        encoder_outputs, hidden, cell = self.encoder(x)
-        outputs = self.decoder(encoder_outputs, hidden, cell)
-        return outputs
+        # LSTM前向传播
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden_size)
+        # 全连接层输出
+        outputs = self.fc(lstm_out)  # (batch, seq_len, 1)
+        return outputs.squeeze(-1)  # (batch, seq_len)
 
 
 # ==================== 数据处理 ====================
@@ -224,25 +162,45 @@ class DataProcessor:
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         
-        # 特征列名
+        # 特征列名（8个特征，包含载荷）
         self.feature_cols = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                            'Temperature', 'Humidity', 'wind_angle']
+                            'Temperature', 'Humidity', 'wind_angle', 'payload']
         
         # 标准化器
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
         
     def load_data(self):
-        """加载所有飞行轨迹数据"""
+        """加载所有飞行轨迹数据（包含载荷信息）"""
         all_data = []
         
         for data_dir in self.data_dirs:
             trajectory_path = os.path.join(data_dir, "flightTrajectory.xlsx")
+            record_path = os.path.join(data_dir, "flightRecord.xlsx")
+            
             if os.path.exists(trajectory_path):
-                print(f"[INFO] 加载数据: {trajectory_path}")
+                print(f"[INFO] 加载轨迹数据: {trajectory_path}")
                 df = pd.read_excel(trajectory_path)
-                all_data.append(df)
                 print(f"  - 数据量: {len(df)} 条记录, {df['Order ID'].nunique()} 个航次")
+                
+                # 加载飞行记录以获取载荷信息
+                if os.path.exists(record_path):
+                    print(f"[INFO] 加载飞行记录: {record_path}")
+                    record_df = pd.read_excel(record_path)
+                    
+                    # 通过Order ID关联载荷信息
+                    if 'Payload (kg)' in record_df.columns:
+                        payload_map = record_df.set_index('Order ID')['Payload (kg)'].to_dict()
+                        df['payload'] = df['Order ID'].map(payload_map)
+                        print(f"  - 成功关联载荷信息，有效载荷数据: {df['payload'].notna().sum()} 条")
+                    else:
+                        print(f"  - 警告: 飞行记录中没有Payload (kg)列")
+                        df['payload'] = 0.0
+                else:
+                    print(f"  - 警告: 未找到飞行记录文件，载荷设为0")
+                    df['payload'] = 0.0
+                
+                all_data.append(df)
         
         if not all_data:
             raise ValueError("未找到任何飞行轨迹数据文件")
@@ -265,6 +223,13 @@ class DataProcessor:
         # wind_angle = |Wind Direct - Course|，取0-180度范围
         df['wind_angle'] = np.abs(df['Wind Direct'] - df['Course'])
         df['wind_angle'] = df['wind_angle'].apply(lambda x: x if x <= 180 else 360 - x)
+        
+        # 处理载荷缺失值（用0填充，表示空载）
+        if 'payload' in df.columns:
+            payload_missing = df['payload'].isna().sum()
+            if payload_missing > 0:
+                print(f"[INFO] 载荷缺失值: {payload_missing} 条，用0填充")
+                df['payload'] = df['payload'].fillna(0.0)
         
         # 处理缺失值
         df = df.dropna(subset=self.feature_cols + ['Power'])
@@ -364,7 +329,7 @@ class Seq2SeqTrainer:
         self.val_losses = []
     
     def train(self, train_loader, val_loader, epochs=100, lr=0.001, 
-              patience=15, save_path='result/power_lstm_seq2seq_model.pth'):
+              patience=15, save_path='result/power_lstm_model.pth'):
         """训练模型"""
         
         optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
@@ -689,12 +654,11 @@ def main():
     
     # ===== 2. 创建模型 =====
     # 统一参数配置（与GRU/Bi-LSTM/Transformer保持一致以便公平对比）
-    model = LSTMSeq2Seq(
-        input_size=7,        # 7个输入特征
+    model = LSTMModel(
+        input_size=8,        # 8个输入特征（包含载荷）
         hidden_size=256,     # 隐藏层大小（统一为256）
         num_layers=3,        # LSTM层数（统一为3）
-        dropout=0.2,         # Dropout比例（统一为0.2）
-        bidirectional=True   # 双向LSTM
+        dropout=0.2          # Dropout比例（统一为0.2）
     )
     
     print(f"\n[INFO] 模型结构:")
@@ -717,7 +681,7 @@ def main():
         epochs=100,          # 统一为100轮
         lr=0.001,            # 统一学习率
         patience=20,         # 统一早停耐心值
-        save_path='result/power_lstm_seq2seq_model.pth'
+        save_path='result/power_lstm_model.pth'
     )
     
     # ===== 4. 评估模型 =====
@@ -764,7 +728,7 @@ def main():
     print("\n" + "="*60)
     print("训练完成！")
     print("="*60)
-    print(f"模型文件: result/power_lstm_seq2seq_model.pth")
+    print(f"模型文件: result/power_lstm_model.pth")
     print(f"训练历史: result/lstm_training_history.png")
     print(f"散点图:   result/lstm_prediction_scatter.png")
     print(f"序列对比: result/lstm_sequence_comparison.png")

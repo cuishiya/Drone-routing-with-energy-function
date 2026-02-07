@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-基于GRU的Seq2Seq瞬时功率预测模型
+标准GRU瞬时功率预测模型
 
 GRU (Gated Recurrent Unit) 相比LSTM结构更简单，参数更少，训练更快。
 
-输入特征序列 (每个时刻7个特征):
+输入特征序列 (每个时刻8个特征):
 - height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -14,9 +14,14 @@ GRU (Gated Recurrent Unit) 相比LSTM结构更简单，参数更少，训练更�
 - temperature: 温度 [°C]
 - humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+- payload: 载荷 [kg]
 
 输出序列:
 - 瞬时功率序列 [W]
+
+模型架构: 标准GRU
+- GRU层: 提取时序特征
+- 全连接层: 输出功率预测
 """
 
 import pandas as pd
@@ -42,84 +47,46 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[INFO] 使用设备: {device}")
 
 
-# ==================== GRU Seq2Seq 模型定义 ====================
+# ==================== 标准 GRU 模型定义 ====================
 
-class GRUEncoder(nn.Module):
-    """GRU编码器"""
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUEncoder, self).__init__()
+class GRUModel(nn.Module):
+    """
+    标准GRU功率预测模型
+    
+    结构: GRU层 -> 全连接层
+    输入: (batch_size, seq_len, input_size)
+    输出: (batch_size, seq_len) 每个时刻的功率预测
+    """
+    def __init__(self, input_size=8, hidden_size=128, num_layers=2, dropout=0.2):
+        super(GRUModel, self).__init__()
+        
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
         
+        # GRU层
         self.gru = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
+            dropout=dropout if num_layers > 1 else 0
         )
+        
+        # 全连接输出层
+        self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        outputs, hidden = self.gru(x)
-        return outputs, hidden
-
-
-class GRUDecoder(nn.Module):
-    """GRU解码器"""
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUDecoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_directions = 2 if bidirectional else 1
-        
-        decoder_input_size = hidden_size * self.num_directions
-        
-        self.gru = nn.GRU(
-            input_size=decoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-        
-        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden):
-        decoder_outputs, _ = self.gru(encoder_outputs, hidden)
-        outputs = self.fc(decoder_outputs)
-        return outputs.squeeze(-1)
-
-
-class GRUSeq2Seq(nn.Module):
-    """GRU Seq2Seq 完整模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
-                 dropout=0.2, bidirectional=True):
-        super(GRUSeq2Seq, self).__init__()
-        
-        self.encoder = GRUEncoder(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-        
-        self.decoder = GRUDecoder(
-            hidden_size=hidden_size,
-            output_size=1,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        encoder_outputs, hidden = self.encoder(x)
-        outputs = self.decoder(encoder_outputs, hidden)
-        return outputs
+        """
+        Args:
+            x: (batch_size, seq_len, input_size)
+        Returns:
+            outputs: (batch_size, seq_len) - 预测的功率序列
+        """
+        # GRU前向传播
+        gru_out, _ = self.gru(x)  # (batch, seq_len, hidden_size)
+        # 全连接层输出
+        outputs = self.fc(gru_out)  # (batch, seq_len, 1)
+        return outputs.squeeze(-1)  # (batch, seq_len)
 
 
 # ==================== 数据处理 ====================
@@ -163,20 +130,39 @@ class DataProcessor:
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.feature_cols = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                            'Temperature', 'Humidity', 'wind_angle']
+                            'Temperature', 'Humidity', 'wind_angle', 'payload']
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
     
     def load_data(self, data_dirs):
-        """加载数据"""
+        """加载数据（包含载荷信息）"""
         all_data = []
         for data_dir in data_dirs:
             trajectory_path = os.path.join(data_dir, "flightTrajectory.xlsx")
+            record_path = os.path.join(data_dir, "flightRecord.xlsx")
+            
             if os.path.exists(trajectory_path):
-                print(f"[INFO] 加载: {trajectory_path}")
+                print(f"[INFO] 加载轨迹数据: {trajectory_path}")
                 df = pd.read_excel(trajectory_path)
                 n_orders = df['Order ID'].nunique()
                 print(f"  - 数据量: {len(df)} 条记录, {n_orders} 个航次")
+                
+                # 加载飞行记录以获取载荷信息
+                if os.path.exists(record_path):
+                    print(f"[INFO] 加载飞行记录: {record_path}")
+                    record_df = pd.read_excel(record_path)
+                    
+                    if 'Payload (kg)' in record_df.columns:
+                        payload_map = record_df.set_index('Order ID')['Payload (kg)'].to_dict()
+                        df['payload'] = df['Order ID'].map(payload_map)
+                        print(f"  - 成功关联载荷信息，有效载荷数据: {df['payload'].notna().sum()} 条")
+                    else:
+                        print(f"  - 警告: 飞行记录中没有Payload (kg)列")
+                        df['payload'] = 0.0
+                else:
+                    print(f"  - 警告: 未找到飞行记录文件，载荷设为0")
+                    df['payload'] = 0.0
+                
                 all_data.append(df)
         
         combined_df = pd.concat(all_data, ignore_index=True)
@@ -194,6 +180,13 @@ class DataProcessor:
         # 计算风向夹角
         df['wind_angle'] = np.abs(df['Wind Direct'] - df['Course'])
         df['wind_angle'] = df['wind_angle'].apply(lambda x: x if x <= 180 else 360 - x)
+        
+        # 处理载荷缺失值（用0填充，表示空载）
+        if 'payload' in df.columns:
+            payload_missing = df['payload'].isna().sum()
+            if payload_missing > 0:
+                print(f"[INFO] 载荷缺失值: {payload_missing} 条，用0填充")
+                df['payload'] = df['payload'].fillna(0.0)
         
         # 处理缺失值
         df = df.dropna(subset=self.feature_cols + ['Power'])
@@ -469,12 +462,11 @@ def main():
     
     # ===== 2. 创建模型 =====
     # 统一参数配置（与LSTM/Bi-LSTM/Transformer保持一致以便公平对比）
-    model = GRUSeq2Seq(
-        input_size=7,
+    model = GRUModel(
+        input_size=8,        # 8个输入特征（包含载荷）
         hidden_size=256,     # 隐藏层大小（统一为256）
         num_layers=3,        # GRU层数（统一为3）
-        dropout=0.2,         # Dropout比例（统一为0.2）
-        bidirectional=True
+        dropout=0.2          # Dropout比例（统一为0.2）
     ).to(device)
     
     print(f"\n[INFO] 模型结构:\n{model}")

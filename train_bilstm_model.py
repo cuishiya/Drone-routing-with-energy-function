@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-基于Bi-LSTM的瞬时功率预测模型
+标准Bi-LSTM瞬时功率预测模型
 
 Bi-LSTM (Bidirectional LSTM) 双向LSTM，同时利用过去和未来的上下文信息。
-与Seq2Seq不同，这里使用简化的Bi-LSTM直接输出功率序列。
 
-输入特征序列 (每个时刻7个特征):
+输入特征序列 (每个时刻8个特征):
 - height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -15,9 +14,14 @@ Bi-LSTM (Bidirectional LSTM) 双向LSTM，同时利用过去和未来的上下�
 - temperature: 温度 [°C]
 - humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+- payload: 载荷 [kg]
 
 输出序列:
 - 瞬时功率序列 [W]
+
+模型架构: 标准Bi-LSTM
+- 双向LSTM层: 提取双向时序特征
+- 全连接层: 输出功率预测
 """
 
 import pandas as pd
@@ -43,11 +47,17 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[INFO] 使用设备: {device}")
 
 
-# ==================== Bi-LSTM 模型定义 ====================
+# ==================== 标准 Bi-LSTM 模型定义 ====================
 
 class BiLSTMModel(nn.Module):
-    """双向LSTM功率预测模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=3, dropout=0.3):
+    """
+    标准双向LSTM功率预测模型
+    
+    结构: 双向LSTM层 -> 全连接层
+    输入: (batch_size, seq_len, input_size)
+    输出: (batch_size, seq_len) 每个时刻的功率预测
+    """
+    def __init__(self, input_size=8, hidden_size=128, num_layers=3, dropout=0.2):
         super(BiLSTMModel, self).__init__()
         
         self.hidden_size = hidden_size
@@ -63,29 +73,21 @@ class BiLSTMModel(nn.Module):
             bidirectional=True
         )
         
-        # 注意力机制
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
-        )
-        
-        # 输出层
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1)
-        )
+        # 全连接输出层（双向所以hidden_size * 2）
+        self.fc = nn.Linear(hidden_size * 2, 1)
     
     def forward(self, x):
-        # LSTM前向传播
-        lstm_out, _ = self.lstm(x)  # [batch, seq_len, hidden*2]
-        
-        # 直接通过全连接层输出
-        output = self.fc(lstm_out)  # [batch, seq_len, 1]
-        
-        return output.squeeze(-1)  # [batch, seq_len]
+        """
+        Args:
+            x: (batch_size, seq_len, input_size)
+        Returns:
+            outputs: (batch_size, seq_len) - 预测的功率序列
+        """
+        # 双向LSTM前向传播
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden*2)
+        # 全连接层输出
+        outputs = self.fc(lstm_out)  # (batch, seq_len, 1)
+        return outputs.squeeze(-1)  # (batch, seq_len)
 
 
 # ==================== 数据处理 ====================
@@ -129,20 +131,39 @@ class DataProcessor:
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.feature_cols = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                            'Temperature', 'Humidity', 'wind_angle']
+                            'Temperature', 'Humidity', 'wind_angle', 'payload']
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
     
     def load_data(self, data_dirs):
-        """加载数据"""
+        """加载数据（包含载荷信息）"""
         all_data = []
         for data_dir in data_dirs:
             trajectory_path = os.path.join(data_dir, "flightTrajectory.xlsx")
+            record_path = os.path.join(data_dir, "flightRecord.xlsx")
+            
             if os.path.exists(trajectory_path):
-                print(f"[INFO] 加载: {trajectory_path}")
+                print(f"[INFO] 加载轨迹数据: {trajectory_path}")
                 df = pd.read_excel(trajectory_path)
                 n_orders = df['Order ID'].nunique()
                 print(f"  - 数据量: {len(df)} 条记录, {n_orders} 个航次")
+                
+                # 加载飞行记录以获取载荷信息
+                if os.path.exists(record_path):
+                    print(f"[INFO] 加载飞行记录: {record_path}")
+                    record_df = pd.read_excel(record_path)
+                    
+                    if 'Payload (kg)' in record_df.columns:
+                        payload_map = record_df.set_index('Order ID')['Payload (kg)'].to_dict()
+                        df['payload'] = df['Order ID'].map(payload_map)
+                        print(f"  - 成功关联载荷信息，有效载荷数据: {df['payload'].notna().sum()} 条")
+                    else:
+                        print(f"  - 警告: 飞行记录中没有Payload (kg)列")
+                        df['payload'] = 0.0
+                else:
+                    print(f"  - 警告: 未找到飞行记录文件，载荷设为0")
+                    df['payload'] = 0.0
+                
                 all_data.append(df)
         
         combined_df = pd.concat(all_data, ignore_index=True)
@@ -160,6 +181,13 @@ class DataProcessor:
         # 计算风向夹角
         df['wind_angle'] = np.abs(df['Wind Direct'] - df['Course'])
         df['wind_angle'] = df['wind_angle'].apply(lambda x: x if x <= 180 else 360 - x)
+        
+        # 处理载荷缺失值（用0填充，表示空载）
+        if 'payload' in df.columns:
+            payload_missing = df['payload'].isna().sum()
+            if payload_missing > 0:
+                print(f"[INFO] 载荷缺失值: {payload_missing} 条，用0填充")
+                df['payload'] = df['payload'].fillna(0.0)
         
         # 处理缺失值
         df = df.dropna(subset=self.feature_cols + ['Power'])
@@ -436,7 +464,7 @@ def main():
     # ===== 2. 创建模型 =====
     # 统一参数配置（与LSTM/GRU/Transformer保持一致以便公平对比）
     model = BiLSTMModel(
-        input_size=7,
+        input_size=8,  # 8个输入特征（包含载荷）
         hidden_size=256,     # 隐藏层大小（统一为256）
         num_layers=3,        # LSTM层数（统一为3）
         dropout=0.2          # Dropout比例（统一为0.2）
@@ -459,7 +487,7 @@ def main():
         epochs=100,          # 统一为100轮
         lr=0.001,            # 统一学习率
         patience=20,         # 统一早停耐心值
-        save_path='result/power_bilstm_v2_model.pth'
+        save_path='result/power_bilstm_model.pth'
     )
     
     print(f"\n[INFO] 训练完成，最佳验证损失: {best_loss:.6f}")
@@ -485,7 +513,7 @@ def main():
     print("\n" + "="*60)
     print("训练完成！")
     print("="*60)
-    print(f"模型文件: result/power_bilstm_v2_model.pth")
+    print(f"模型文件: result/power_bilstm_model.pth")
 
 
 if __name__ == "__main__":

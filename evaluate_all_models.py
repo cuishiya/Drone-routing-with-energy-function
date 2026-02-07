@@ -38,98 +38,44 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[INFO] 使用设备: {device}")
 
 
-# ==================== 模型定义 ====================
+# ==================== 标准模型定义 ====================
 
-# LSTM Seq2Seq
-class LSTMEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMEncoder, self).__init__()
+# 标准 LSTM
+class LSTMModel(nn.Module):
+    """标准LSTM功率预测模型"""
+    def __init__(self, input_size=8, hidden_size=128, num_layers=2, dropout=0.2):
+        super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional)
+                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        outputs, (hidden, cell) = self.lstm(x)
-        return outputs, hidden, cell
+        lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out).squeeze(-1)
 
 
-class LSTMDecoder(nn.Module):
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMDecoder, self).__init__()
-        num_directions = 2 if bidirectional else 1
-        self.lstm = nn.LSTM(input_size=hidden_size * num_directions, hidden_size=hidden_size, num_layers=num_layers,
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional)
-        self.fc = nn.Linear(hidden_size * num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden, cell):
-        decoder_outputs, _ = self.lstm(encoder_outputs, (hidden, cell))
-        return self.fc(decoder_outputs).squeeze(-1)
-
-
-class LSTMSeq2Seq(nn.Module):
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMSeq2Seq, self).__init__()
-        self.encoder = LSTMEncoder(input_size, hidden_size, num_layers, dropout, bidirectional)
-        self.decoder = LSTMDecoder(hidden_size, 1, num_layers, dropout, bidirectional)
-    
-    def forward(self, x):
-        encoder_outputs, hidden, cell = self.encoder(x)
-        return self.decoder(encoder_outputs, hidden, cell)
-
-
-# GRU Seq2Seq
-class GRUEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUEncoder, self).__init__()
+# 标准 GRU
+class GRUModel(nn.Module):
+    """标准GRU功率预测模型"""
+    def __init__(self, input_size=8, hidden_size=128, num_layers=2, dropout=0.2):
+        super(GRUModel, self).__init__()
         self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
-                         batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional)
+                         batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        outputs, hidden = self.gru(x)
-        return outputs, hidden
+        gru_out, _ = self.gru(x)
+        return self.fc(gru_out).squeeze(-1)
 
 
-class GRUDecoder(nn.Module):
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUDecoder, self).__init__()
-        num_directions = 2 if bidirectional else 1
-        self.gru = nn.GRU(input_size=hidden_size * num_directions, hidden_size=hidden_size, num_layers=num_layers,
-                         batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional)
-        self.fc = nn.Linear(hidden_size * num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden):
-        decoder_outputs, _ = self.gru(encoder_outputs, hidden)
-        return self.fc(decoder_outputs).squeeze(-1)
-
-
-class GRUSeq2Seq(nn.Module):
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUSeq2Seq, self).__init__()
-        self.encoder = GRUEncoder(input_size, hidden_size, num_layers, dropout, bidirectional)
-        self.decoder = GRUDecoder(hidden_size, 1, num_layers, dropout, bidirectional)
-    
-    def forward(self, x):
-        encoder_outputs, hidden = self.encoder(x)
-        return self.decoder(encoder_outputs, hidden)
-
-
-# Bi-LSTM
+# 标准 Bi-LSTM
 class BiLSTMModel(nn.Module):
-    def __init__(self, input_size=7, hidden_size=128, num_layers=3, dropout=0.3):
+    """标准双向LSTM功率预测模型"""
+    def __init__(self, input_size=8, hidden_size=128, num_layers=3, dropout=0.2):
         super(BiLSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
                            batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=True)
-        # 注意力机制（与训练脚本保持一致）
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1)
-        )
+        self.fc = nn.Linear(hidden_size * 2, 1)  # 双向所以 * 2
     
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
@@ -155,7 +101,7 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_size=7, d_model=128, nhead=8, num_layers=4, dim_feedforward=512, dropout=0.1, max_len=500):
+    def __init__(self, input_size=8, d_model=128, nhead=8, num_layers=4, dim_feedforward=512, dropout=0.1, max_len=500):
         super(TransformerModel, self).__init__()
         self.d_model = d_model
         self.input_embedding = nn.Linear(input_size, d_model)
@@ -177,6 +123,35 @@ class TransformerModel(nn.Module):
         return self.output_layer(x).squeeze(-1)
 
 
+# LSTM-Transformer 串行模型
+class LSTMTransformerModel(nn.Module):
+    """LSTM-Transformer串行模型: 输入 → LSTM → Transformer → 输出"""
+    def __init__(self, input_size=8, d_model=256, lstm_layers=2,
+                 nhead=8, num_transformer_layers=3, dim_feedforward=512, 
+                 dropout=0.1, max_len=500):
+        super(LSTMTransformerModel, self).__init__()
+        
+        self.d_model = d_model
+        self.input_embedding = nn.Linear(input_size, d_model)
+        self.lstm = nn.LSTM(input_size=d_model, hidden_size=d_model // 2, num_layers=lstm_layers,
+                           batch_first=True, dropout=dropout if lstm_layers > 1 else 0, bidirectional=True)
+        self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                                                   dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+        self.output_layer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model // 2, 1)
+        )
+    
+    def forward(self, x, src_key_padding_mask=None):
+        x = self.input_embedding(x)
+        x, _ = self.lstm(x)
+        x = x * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+        return self.output_layer(x).squeeze(-1)
+
+
 # ==================== 模型评估器 ====================
 
 class ModelEvaluator:
@@ -185,29 +160,35 @@ class ModelEvaluator:
     def __init__(self):
         self.device = device
         self.feature_cols = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                            'Temperature', 'Humidity', 'wind_angle']
+                            'Temperature', 'Humidity', 'wind_angle', 'payload']
         
-        # 模型配置（统一参数：hidden_size=256, num_layers=3, dropout=0.2）
+        # 模型配置
         self.model_configs = {
             'LSTM': {
-                'path': 'result/power_lstm_seq2seq_model.pth',
-                'class': LSTMSeq2Seq,
-                'params': {'input_size': 7, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2, 'bidirectional': True}
+                'path': 'result/power_lstm_model.pth',
+                'class': LSTMModel,
+                'params': {'input_size': 8, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
             },
             'GRU': {
                 'path': 'result/power_gru_model.pth',
-                'class': GRUSeq2Seq,
-                'params': {'input_size': 7, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2, 'bidirectional': True}
+                'class': GRUModel,
+                'params': {'input_size': 8, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
             },
             'Bi-LSTM': {
-                'path': 'result/power_bilstm_v2_model.pth',
+                'path': 'result/power_bilstm_model.pth',
                 'class': BiLSTMModel,
-                'params': {'input_size': 7, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
+                'params': {'input_size': 8, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
             },
             'Transformer': {
                 'path': 'result/power_transformer_model.pth',
                 'class': TransformerModel,
-                'params': {'input_size': 7, 'd_model': 256, 'nhead': 8, 'num_layers': 3, 'dim_feedforward': 1024, 'dropout': 0.2, 'max_len': 500}
+                'params': {'input_size': 8, 'd_model': 256, 'nhead': 8, 'num_layers': 3, 'dim_feedforward': 1024, 'dropout': 0.2, 'max_len': 500}
+            },
+            'LSTM-Transformer': {
+                'path': 'result/power_lstm_transformer_model.pth',
+                'class': LSTMTransformerModel,
+                'params': {'input_size': 8, 'd_model': 256, 'lstm_layers': 2, 
+                          'nhead': 8, 'num_transformer_layers': 3, 'dim_feedforward': 512, 'dropout': 0.1, 'max_len': 500}
             }
         }
         
@@ -239,17 +220,39 @@ class ModelEvaluator:
                 print(f"[WARNING] {name} 模型文件不存在: {config['path']}")
     
     def load_test_data(self, test_path=None, min_seq_len=20, max_seq_len=500):
-        """加载测试数据"""
+        """加载测试数据（包含载荷信息）"""
         if test_path is None:
             test_path = "Drone_energy_dataset/test_data/flightTrajectory.xlsx"
         
+        # 获取对应的飞行记录路径
+        test_dir = os.path.dirname(test_path)
+        record_path = os.path.join(test_dir, "flightRecord.xlsx")
+        
         print(f"[INFO] 加载测试数据: {test_path}")
         df = pd.read_excel(test_path)
+        
+        # 加载载荷信息
+        if os.path.exists(record_path):
+            print(f"[INFO] 加载飞行记录: {record_path}")
+            record_df = pd.read_excel(record_path)
+            if 'Payload (kg)' in record_df.columns:
+                payload_map = record_df.set_index('Order ID')['Payload (kg)'].to_dict()
+                df['payload'] = df['Order ID'].map(payload_map)
+                print(f"  - 成功关联载荷信息，有效载荷数据: {df['payload'].notna().sum()} 条")
+            else:
+                print(f"  - 警告: 飞行记录中没有Payload (kg)列")
+                df['payload'] = 0.0
+        else:
+            print(f"  - 警告: 未找到飞行记录文件，载荷设为0")
+            df['payload'] = 0.0
         
         # 预处理
         df['Power'] = (df['Voltage'] / 1000.0) * (df['Current'] / 1000.0)
         df['wind_angle'] = np.abs(df['Wind Direct'] - df['Course'])
         df['wind_angle'] = df['wind_angle'].apply(lambda x: x if x <= 180 else 360 - x)
+        
+        # 处理载荷缺失值
+        df['payload'] = df['payload'].fillna(0.0)
         
         # 过滤
         df = df.dropna(subset=self.feature_cols + ['Power'])
@@ -387,6 +390,11 @@ def plot_metrics_comparison(results, predictions_dict, time_interval=1.0, save_p
         
         true_energies = np.array(true_energies)
         pred_energies = np.array(pred_energies)
+        
+        # 过滤掉实际能耗大于425 Wh的异常航次
+        valid_mask = true_energies <= 425
+        true_energies = true_energies[valid_mask]
+        pred_energies = pred_energies[valid_mask]
         
         energy_rmse = np.sqrt(mean_squared_error(true_energies, pred_energies))
         energy_mae = mean_absolute_error(true_energies, pred_energies)
@@ -572,6 +580,11 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
         true_energies = np.array(true_energies)
         pred_energies = np.array(pred_energies)
         
+        # 过滤掉实际能耗大于425 Wh的异常航次
+        valid_mask = true_energies <= 425
+        true_energies = true_energies[valid_mask]
+        pred_energies = pred_energies[valid_mask]
+        
         # 计算能耗预测指标
         energy_rmse = np.sqrt(mean_squared_error(true_energies, pred_energies))
         energy_mae = mean_absolute_error(true_energies, pred_energies)
@@ -623,16 +636,10 @@ def plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3, sav
     if n_samples == 1:
         axes = axes.reshape(1, n_models)
     
-    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373'}
+    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373', 'LSTM-Transformer': '#9C27B0'}
     
-    # 选择不同长度的航次样本
-    seq_lengths = [len(t) for t in targets]
-    sorted_indices = np.argsort(seq_lengths)
-    sample_indices = [
-        sorted_indices[len(sorted_indices) // 4],      # 较短
-        sorted_indices[len(sorted_indices) // 2],      # 中等
-        sorted_indices[6 * len(sorted_indices) // 10]   # 较长
-    ][:n_samples]
+    # 选择指定的航次：第1、4、5个（索引0、3、4）
+    sample_indices = [0, 3, 4][:min(n_samples, len(targets))]
     
     for row, sample_idx in enumerate(sample_indices):
         for col, (model_name, (preds, trues)) in enumerate(predictions_dict.items()):
@@ -737,7 +744,7 @@ def main():
         plot_energy_comparison(predictions_dict, time_interval=1.0, 
                               save_path='result/scatter_comparison.png')
         
-        # 多航次序列预测样本图（展示不同航次的功率曲线对比）
+        # 多航次序列预测样本图（展示第1、4、5个航次的功率曲线对比）
         plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3,
                              save_path='result/power_curves_comparison.png')
     
