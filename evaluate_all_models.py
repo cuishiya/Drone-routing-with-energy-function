@@ -9,6 +9,8 @@
 - GRU Seq2Seq
 - Bi-LSTM
 - Transformer
+- LSTM-Transformer
+- LSTM-FC（基线对照模型）
 
 评估指标:
 - RMSE: 均方根误差
@@ -51,6 +53,46 @@ class LSTMModel(nn.Module):
     
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out).squeeze(-1)
+
+
+# LSTM-FC（基线对照模型）
+class LSTMFCModel(nn.Module):
+    """LSTM-FC功率预测模型（基线对照模型）- 优化版"""
+    def __init__(self, input_size=8, hidden_size=256, num_layers=3, dropout=0.2):
+        super(LSTMFCModel, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # 输入嵌入层
+        self.input_embedding = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5)
+        )
+        
+        # 多层 LSTM
+        self.lstm = nn.LSTM(input_size=hidden_size, hidden_size=hidden_size, num_layers=num_layers,
+                           batch_first=True, dropout=dropout if num_layers > 1 else 0, bidirectional=False)
+        
+        # Layer Normalization
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+        # 全连接输出网络（两层）
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        # 残差连接投影层
+        self.residual_proj = nn.Linear(hidden_size, hidden_size)
+    
+    def forward(self, x):
+        embedded = self.input_embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        residual = self.residual_proj(embedded)
+        lstm_out = self.layer_norm(lstm_out + residual)
         return self.fc(lstm_out).squeeze(-1)
 
 
@@ -177,6 +219,11 @@ class ModelEvaluator:
             'Bi-LSTM': {
                 'path': 'result/power_bilstm_model.pth',
                 'class': BiLSTMModel,
+                'params': {'input_size': 8, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
+            },
+            'LSTM-FC': {
+                'path': 'result/power_lstm_fc_model.pth',
+                'class': LSTMFCModel,
                 'params': {'input_size': 8, 'hidden_size': 256, 'num_layers': 3, 'dropout': 0.2}
             },
             'Transformer': {
@@ -374,8 +421,10 @@ def plot_metrics_comparison(results, predictions_dict, time_interval=1.0, save_p
         return
     
     models = list(results.keys())
-    # 使用参考图片的配色风格
-    colors = ['#7BC47F', '#4A90D9', '#F5A962', '#E57373']  # 绿、蓝、橙、红
+    # 使用参考图片的配色风格（支持6个模型）
+    color_map = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 
+                 'Transformer': '#E57373', 'LSTM-Transformer': '#9C27B0', 'LSTM-FC': '#00BCD4'}
+    colors = [color_map.get(m, '#888888') for m in models]
     
     # 计算航次能耗指标
     energy_metrics = {}
@@ -429,18 +478,18 @@ def plot_metrics_comparison(results, predictions_dict, time_interval=1.0, save_p
         for bar, val in zip(bars, values):
             if metric == 'R2':
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_max-y_min)*0.02, 
-                       f'{val:.3f}', ha='center', va='bottom', fontsize=10, color='black')
+                       f'{val:.3f}', ha='center', va='bottom', fontsize=11, color='black')
             else:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_max-y_min)*0.02, 
-                       f'{val:.1f}', ha='center', va='bottom', fontsize=10, color='black')
+                       f'{val:.1f}', ha='center', va='bottom', fontsize=11, color='black')
         
         # 使用LaTeX格式显示R²
         if metric == 'R2':
             ylabel = r'$R^2$ Score'
         else:
             ylabel = f'{metric} ({unit})'
-        ax.set_ylabel(ylabel, fontsize=11, fontweight='bold')
-        ax.set_title(label, fontsize=12, fontweight='bold', loc='left')
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(label, fontsize=13, fontweight='bold', loc='left')
         ax.set_ylim(y_min, y_max + (y_max-y_min)*0.15)  # 留出数值显示空间
         ax.tick_params(axis='x', rotation=15)
         
@@ -471,18 +520,18 @@ def plot_metrics_comparison(results, predictions_dict, time_interval=1.0, save_p
         for bar, val in zip(bars, values):
             if metric == 'R2':
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_max-y_min)*0.02, 
-                       f'{val:.3f}', ha='center', va='bottom', fontsize=10, color='black')
+                       f'{val:.3f}', ha='center', va='bottom', fontsize=11, color='black')
             else:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + (y_max-y_min)*0.02, 
-                       f'{val:.2f}', ha='center', va='bottom', fontsize=10, color='black')
+                       f'{val:.2f}', ha='center', va='bottom', fontsize=11, color='black')
         
         # 使用LaTeX格式显示R²
         if metric == 'R2':
             ylabel = r'$R^2$ Score'
         else:
             ylabel = f'{metric} ({unit})'
-        ax.set_ylabel(ylabel, fontsize=11, fontweight='bold')
-        ax.set_title(label, fontsize=12, fontweight='bold', loc='left')
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(label, fontsize=13, fontweight='bold', loc='left')
         ax.set_ylim(y_min, y_max + (y_max-y_min)*0.15)  # 留出数值显示空间
         ax.tick_params(axis='x', rotation=15)
         
@@ -492,9 +541,9 @@ def plot_metrics_comparison(results, predictions_dict, time_interval=1.0, save_p
     
     # 添加行标题（放在图表外侧）
     fig.text(0.5, 0.95, '逐点功率预测指标 (评估每个时刻瞬时功率的预测精度)', 
-             ha='center', fontsize=12, fontweight='bold')
+             ha='center', fontsize=13, fontweight='bold')
     fig.text(0.5, 0.47, '航次总能耗指标 (评估整个航次能耗的预测精度)', 
-             ha='center', fontsize=12, fontweight='bold')
+             ha='center', fontsize=13, fontweight='bold')
     
     plt.tight_layout()
     plt.subplots_adjust(top=0.92, hspace=0.35)
@@ -509,25 +558,45 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
     """
     绘制散点图对比（同时展示逐点功率和航次能耗）
     
-    上排：逐点功率预测散点图（每个点是一个时刻的功率）
-    下排：航次能耗预测散点图（每个点是一个完整航次的总能耗）
+    布局：每行3个模型，每组模型（3个）占两行（功率+能耗）
+    - 第1行：模型1-3的逐点功率散点图
+    - 第2行：模型1-3的航次能耗散点图
+    - 第3行：模型4-6的逐点功率散点图
+    - 第4行：模型4-6的航次能耗散点图
     """
     if not predictions_dict:
         return
     
     n_models = len(predictions_dict)
-    fig, axes = plt.subplots(2, n_models, figsize=(4.5 * n_models, 9))
+    n_cols = 3  # 每行3个模型
+    n_model_groups = (n_models + n_cols - 1) // n_cols  # 模型分组数（每组3个模型）
     
-    if n_models == 1:
-        axes = axes.reshape(2, 1)
+    # 总行数 = 模型组数 × 2（每组占两行：功率+能耗）
+    n_rows = n_model_groups * 2
     
-    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373'}
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4.5 * n_rows))
     
-    for idx, (model_name, (preds, trues)) in enumerate(predictions_dict.items()):
+    # 确保axes是2D数组
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373', 'LSTM-Transformer': '#9C27B0', 'LSTM-FC': '#00BCD4'}
+    
+    model_items = list(predictions_dict.items())
+    
+    for idx, (model_name, (preds, trues)) in enumerate(model_items):
         color = colors.get(model_name, '#4A90D9')
         
-        # ===== 上排：逐点功率散点图 =====
-        ax_power = axes[0, idx]
+        # 计算当前模型在网格中的位置
+        model_group = idx // n_cols  # 模型所在的组（0或1）
+        model_col = idx % n_cols     # 模型所在的列（0、1、2）
+        
+        # 功率行 = 组号 × 2，能耗行 = 组号 × 2 + 1
+        power_row = model_group * 2
+        energy_row = model_group * 2 + 1
+        
+        # ===== 功率散点图 =====
+        ax_power = axes[power_row, model_col]
         
         all_pred = np.concatenate(preds)
         all_true = np.concatenate(trues)
@@ -557,16 +626,16 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
         # 添加指标
         textstr = f'$R^2$ = {power_r2:.4f}\nRMSE = {power_rmse:.1f} W\nMAE = {power_mae:.1f} W'
         props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-        ax_power.text(0.05, 0.95, textstr, transform=ax_power.transAxes, fontsize=9,
+        ax_power.text(0.05, 0.95, textstr, transform=ax_power.transAxes, fontsize=11,
                      verticalalignment='top', horizontalalignment='left', bbox=props)
         
-        ax_power.set_xlabel('实际功率 (W)', fontsize=10)
-        ax_power.set_ylabel('预测功率 (W)', fontsize=10)
-        ax_power.set_title(f'({chr(97+idx)}) {model_name}', fontsize=11, fontweight='bold')
+        ax_power.set_xlabel('实际功率 (W)', fontsize=12)
+        ax_power.set_ylabel('预测功率 (W)', fontsize=12)
+        ax_power.set_title(f'({chr(97+idx)}) {model_name}', fontsize=13, fontweight='bold')
         ax_power.grid(True, alpha=0.3)
         
-        # ===== 下排：航次能耗散点图 =====
-        ax_energy = axes[1, idx]
+        # ===== 能耗散点图 =====
+        ax_energy = axes[energy_row, model_col]
         
         # 计算每个航次的总能耗 (Wh)
         true_energies = []
@@ -600,22 +669,25 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
         # 添加指标
         textstr = f'$R^2$ = {energy_r2:.4f}\nRMSE = {energy_rmse:.2f} Wh\nMAE = {energy_mae:.2f} Wh'
         props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-        ax_energy.text(0.05, 0.95, textstr, transform=ax_energy.transAxes, fontsize=9,
+        ax_energy.text(0.05, 0.95, textstr, transform=ax_energy.transAxes, fontsize=11,
                       verticalalignment='top', horizontalalignment='left', bbox=props)
         
-        ax_energy.set_xlabel('实际能耗 (Wh)', fontsize=10)
-        ax_energy.set_ylabel('预测能耗 (Wh)', fontsize=10)
-        ax_energy.set_title(f'({chr(101+idx)})', fontsize=11, fontweight='bold')
+        ax_energy.set_xlabel('实际能耗 (Wh)', fontsize=12)
+        ax_energy.set_ylabel('预测能耗 (Wh)', fontsize=12)
+        ax_energy.set_title(f'({chr(103+idx)}) {model_name}', fontsize=13, fontweight='bold')
         ax_energy.grid(True, alpha=0.3)
     
-    # 添加行标题
-    fig.text(0.5, 0.97, '逐点功率预测 (每个点=一个时刻的瞬时功率)', ha='center', fontsize=13, fontweight='bold',
-             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
-    fig.text(0.5, 0.48, '航次总能耗预测 (每个点=一个完整航次的总能耗)', ha='center', fontsize=13, fontweight='bold',
-             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+    # 隐藏多余的子图
+    for group in range(n_model_groups):
+        for col in range(n_cols):
+            model_idx = group * n_cols + col
+            if model_idx >= n_models:
+                power_row = group * 2
+                energy_row = group * 2 + 1
+                axes[power_row, col].set_visible(False)
+                axes[energy_row, col].set_visible(False)
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.93, hspace=0.35)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
@@ -624,26 +696,45 @@ def plot_energy_comparison(predictions_dict, time_interval=1.0, save_path='resul
 
 
 def plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3, save_path='result/sequence_samples.png'):
-    """绘制多个航次的序列预测对比图"""
+    """
+    绘制多个航次的序列预测对比图
+    
+    布局：每行3个模型，每个航次占两行（模型1-3和模型4-6）
+    不显示航次标签，指标标注在底部中间位置（两行排版），图例在右下角
+    """
     if not predictions_dict:
         return
     
     n_models = len(predictions_dict)
-    fig, axes = plt.subplots(n_samples, n_models, figsize=(4.5 * n_models, 3.5 * n_samples))
+    n_cols = 3  # 每行3个模型
+    n_model_rows = (n_models + n_cols - 1) // n_cols  # 每个航次需要的行数
     
-    if n_models == 1:
-        axes = axes.reshape(n_samples, 1)
-    if n_samples == 1:
-        axes = axes.reshape(1, n_models)
+    # 总行数 = 航次数 × 每个航次的行数
+    n_rows = n_samples * n_model_rows
     
-    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373', 'LSTM-Transformer': '#9C27B0'}
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3.5 * n_rows))
+    
+    # 确保axes是2D数组
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    colors = {'LSTM': '#4A90D9', 'GRU': '#7BC47F', 'Bi-LSTM': '#F5A962', 'Transformer': '#E57373', 'LSTM-Transformer': '#9C27B0', 'LSTM-FC': '#00BCD4'}
     
     # 选择指定的航次：第1、4、5个（索引0、3、4）
     sample_indices = [0, 3, 4][:min(n_samples, len(targets))]
     
-    for row, sample_idx in enumerate(sample_indices):
-        for col, (model_name, (preds, trues)) in enumerate(predictions_dict.items()):
-            ax = axes[row, col]
+    model_items = list(predictions_dict.items())
+    
+    for sample_row, sample_idx in enumerate(sample_indices):
+        for model_idx, (model_name, (preds, trues)) in enumerate(model_items):
+            # 计算当前模型在网格中的位置
+            model_row_offset = model_idx // n_cols  # 模型在当前航次中的行偏移（0或1）
+            model_col = model_idx % n_cols         # 模型所在的列（0、1、2）
+            
+            # 实际行号 = 航次起始行 + 模型行偏移
+            actual_row = sample_row * n_model_rows + model_row_offset
+            
+            ax = axes[actual_row, model_col]
             
             true_power = trues[sample_idx]
             pred_power = preds[sample_idx]
@@ -659,25 +750,28 @@ def plot_sequence_samples(predictions_dict, targets, order_ids, n_samples=3, sav
             ax.plot(time_axis, pred_power, color=color, linestyle='--', label='预测值', linewidth=1.2, alpha=0.8)
             ax.fill_between(time_axis, true_power, pred_power, alpha=0.15, color=color)
             
-            # 添加指标
-            textstr = f'RMSE={seq_rmse:.1f}W\n$R^2$={seq_r2:.3f}'
+            # 添加指标标注在底部中间位置（两行排版）
+            textstr = f'RMSE={seq_rmse:.1f}W  $R^2$={seq_r2:.3f}'
             props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-            ax.text(0.98, 0.98, textstr, transform=ax.transAxes, fontsize=9,
-                   verticalalignment='top', horizontalalignment='right', bbox=props)
+            ax.text(0.4, 0.08, textstr, transform=ax.transAxes, fontsize=11,
+                   verticalalignment='bottom', horizontalalignment='center', bbox=props)
             
-            ax.set_xlabel('时间 (s)', fontsize=10)
-            ax.set_ylabel('功率 (W)', fontsize=10)
+            ax.set_xlabel('时间 (s)', fontsize=12)
+            ax.set_ylabel('功率 (W)', fontsize=12)
+            ax.set_title(f'{model_name}', fontsize=13, fontweight='bold')
             
-            if row == 0:
-                ax.set_title(f'{model_name}', fontsize=11, fontweight='bold')
-            
-            if col == 0:
-                ax.text(-0.15, 0.5, f'航次 {row+1}\n({len(true_power)}s)', 
-                       transform=ax.transAxes, fontsize=10, verticalalignment='center',
-                       horizontalalignment='right', fontweight='bold')
-            
-            ax.legend(loc='lower right', fontsize=8)
+            # 图例保持在右下角
+            ax.legend(loc='lower right', fontsize=10)
             ax.grid(True, alpha=0.3)
+    
+    # 隐藏多余的子图
+    for sample_row in range(n_samples):
+        for model_row_offset in range(n_model_rows):
+            for col in range(n_cols):
+                model_idx = model_row_offset * n_cols + col
+                if model_idx >= n_models:
+                    actual_row = sample_row * n_model_rows + model_row_offset
+                    axes[actual_row, col].set_visible(False)
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
