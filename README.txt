@@ -104,3 +104,35 @@
 - result/power_linear_model.pkl: 线性回归模型
 
 
+
+==================== 最新进展 ====================
+
+- 2026-06-03：
+  1. 在 `mtdrp_energy_model.py` 中实现多行程无人机模型，并接入 LSTM-Transformer 能耗预测。
+  2. 在 `mtdrp_rlts_nsga2.py` 中整合 RLTS-NSGA-II 求解流程，新增自适应位置编码、能耗缓存与进度日志。
+  3. 默认算例指向 `标准算例/instances/test_small_20.dat`，可以直接运行脚本得到帕累托前沿与可视化结果。
+
+
+==================== 运行指南 ====================
+
+1. **准备环境**
+   ```bash
+   D:/MyApp/Anaconda/envs/pygmo_env/python.exe -m pip install -r requirements.txt
+   ```
+   - 所有运行请保持在该虚拟环境中完成。
+
+2. **求解多行程无人机路径问题**
+   ```bash
+   D:/MyApp/Anaconda/envs/pygmo_env/python.exe mtdrp_rlts_nsga2.py
+   ```
+   - 脚本会自动加载 `标准算例/instances/test_small_20.dat`。
+   - 终端将输出每代耗时、禁忌搜索改进数量以及最终帕累托统计。
+
+3. **结果查看**
+   - 帕累托曲线与最佳路径图保存到 `result/mtdrp_rlts_nsga2_*.png`。
+   - 详细的最优解信息会在命令行最后打印出来。
+
+4. **常见问题**
+   - 如果第一次推送远程失败，可重试或启用 `git push --set-upstream origin <branch>`。
+   - 若 Matplotlib 保存图片时报错，请确认创建 `result/` 目录或使用新的保存路径。
+
