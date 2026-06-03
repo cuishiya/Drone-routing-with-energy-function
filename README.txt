@@ -1,138 +1,160 @@
- 问题定义 (Problem Definition)
- 这个模型解决的是无人机路径规划问题 (Drone Routing Problem, DRP)。
- 场景： 拥有一队同质的无人机。
- 任务： 从一个中央仓库（Depot）出发，为一组客户提供配送服务。
- 限制：每架无人机有最大载重限制。每架无人机有最大电池能量限制。每个客户必须被服务一次。
- 目标： 最小化总运营成本，这通常被定义为启动成本与总能量消耗成本之和。
- 模型包含以下关键约束：
- 1、流平衡约束：保证无人机到达一个客户后必须离开（除非返回仓库），且每个客户仅被访问一次。
- 2、载重约束：确保无人机在任何时候携带的货物重量不超过其最大载重 $Q$。这部分还使用了“消除子回路 (Subtour elimination)”的逻辑，确保路径是连通的。
- 3、能量/续航约束：这是最难的部分，因为能耗取决于载重，而载重取决于访问顺序。模型必须计算整条路径的累积能耗，并确保其不超过电池容量。
-    如果某条路径虽然距离短，但因为前半程载重过大导致电量耗尽，该模型会自动判定该路径不可行。
+================================================================================
+  多行程无人机路径规划与能量预测系统
+  Multi-Trip Drone Routing Problem with Energy Function
+================================================================================
 
- 
- 核心：低空因素加载重与距离多重影响的能量模型这是该模型最独特的地方。
- 传统的卡车调度模型通常假设油耗与距离成正比，但无人机不同：
- 物理规律： 无人机的能耗不仅取决于飞行的距离，还强烈取决于当前的载重。
- 动态变化： 当无人机送完一个包裹后，它的重量变轻了，因此在下一段路程中，每公里的能耗会下降。
+一、项目概述
+-----------
+本项目基于论文 "Drone routing with energy function: Formulation and exact algorithm"
+(Cheng et al., 2020)，实现了多行程无人机路径规划问题（MTDRP）的建模与求解。
 
+核心思路：
+  1. 使用深度学习时序模型（LSTM-Transformer）预测无人机瞬时功率
+  2. 基于航迹积分计算弧能耗（上升→巡航→下降三段式航迹）
+  3. 采用改进的 RLTS-NSGA-II 多目标优化算法求解路径规划
 
+二、问题定义
+-----------
+场景：一队同质无人机从中央仓库（Depot）出发，为一组客户提供配送服务。
+每架无人机可执行多个行程（Multi-Trip），行程之间可更换电池。
 
+约束条件：
+  - 载重约束：无人机任何时候携带货物不超过最大载重 Q
+  - 能量约束：单次行程累计能耗不超过电池容量 sigma
+  - 时间窗约束：客户有最早/最晚服务时间 [e_i, l_i]
+  - 访问约束：每个客户必须且仅被服务一次
 
- 目前问题：
- 1、没有考虑载重的动态变化：当无人机送完一个包裹后，它的重量变轻了，因此在下一段路程中，每公里的能耗会下降，从而载重与访问顺序之间是有影响的。
- 2、流平衡约束不知道有没有实现，且是如何实现的。
-    答：有实现。项目采用的是启发式/元启发式方法（RLTS-NSGA-II），而非数学规划求解器，因此流平衡约束是通过解的编码和构造方式隐式保证的。
- 3、能耗模型生成与替换。（选用现有的创新模型，加上我的场景和数据集）
+优化目标（多目标）：
+  - 目标1：最小化总飞行距离
+  - 目标2：最小化总能量消耗
 
+三、能耗预测模型
+---------------
+3.1 航迹模式
+  弧飞行采用三段式航迹：垂直上升 → 水平巡航 → 垂直下降
+  对整条航迹逐秒采样，生成时序特征序列，输入深度学习模型预测瞬时功率，
+  再积分得到弧总能耗。
 
- 输入是风速风向温度湿度载重距离，输出是消耗多少电量。
- 表格数据由**行（Rows）和列（Columns）**组成，每一行代表一个样本，每一列代表一个特征（属性）。
- 树模型对表格数据有巨大优势。
- XGBoost
- LightGBM
- CatBoost（AI推荐使用）
+3.2 模型输入特征（8个特征）
+  - Height: 高度 [m]
+  - VS: 竖直速度 [m/s]
+  - GS: 地速 [m/s]
+  - Wind Speed: 风速 [m/s]
+  - Temperature: 温度 [°C]
+  - Humidity: 湿度 [%]
+  - Wind Angle: 风向夹角 [度]
+  - Payload: 当前载重 [kg]
 
- 风向特征需特殊处理：
- 问题： 359度和1度在数字上差了358，但在物理上只差2度。而且，纯粹的“自然风向”（比如北风）对无人机耗电没意义，有意义的是风向和无人机飞行方向的夹角（是顶风飞还是顺风飞）。
+3.3 模型输出
+  - 瞬时功率 [W]
 
- 必做的特征工程： 不要直接把“风向（0-360）”扔进模型。你应该计算出相对风向
+3.4 支持的时序深度学习模型
 
- 如果你的数据里有“飞行航向”，计算：相对夹角 = |飞行航向 - 风向|（起点指向终点和Wind Direct数据耦合）
- 把处理后的这个特征喂给 CatBoost，你的预测准确率会提升一大截。
+  模型                   RMSE (W)    MAE (W)     R²        MAPE (%)  参数量
+  --------------------------------------------------------------------------
+  Bi-LSTM                397.78      291.08      0.8287    9.05      996,866
+  GRU Seq2Seq            402.50      295.57      0.8247    7.91      994,817
+  LSTM Seq2Seq           412.86      305.24      0.8155    9.22      1,326,337
+  Transformer            418.51      292.74      0.8104    7.47      802,433
+  LSTM-Transformer       当前主模型（融合LSTM时序建模+Transformer全局注意力）
+  LSTM-FC                全连接预测头变体
+  TCN                    时序卷积网络
+  Informer               长序列预测模型
 
- 隔两小时就测一次低空数据，更新这天的飞行调度方案。
+  当前求解器默认使用 LSTM-Transformer 模型（result/power_lstm_transformer_model.pth）
 
- 准确性验证
- 对比模型：
- 1、非线性物理模型（已实现）
- 2、基于距离和载荷的线性回归（说明考虑低空气象因素有帮助）
- 3、深度学习模型
- 4、LightGBM树模型
+四、求解算法：RLTS-NSGA-II
+-------------------------
+基于 NSGA-II 多目标遗传算法，集成以下改进：
+  - Q-Learning 自适应参数调节：动态调整交叉率 CR 和变异率 M
+  - 反应式禁忌搜索（RLTS）：周期性对精英个体进行局部搜索改进
+  - 多行程时间衔接：跟踪每架无人机的可用时间，实现行程间电池更换
+  - 载重流显式记录：记录每条弧的实时载重 q_ij
+  - 能量累计检查：使用 f_i 变量逐节点检查能量约束
 
- 指标
- 1、RMSE (均方根误差)：预测值与真实值差值的平方的平均值，√(Σ(y_pred - y_true)²/n)
- 2、MAE (平均绝对误差)：预测值与真实值差值的绝对值的平均值，Σ|y_pred - y_true|/n
- 3、R² (决定系数)：衡量模型拟合数据的程度，越接近1越好。
+编码方案：
+  [customer_order[0..n-1], drone_assignment[0..n-1], trip_assignment[0..n-1]]
+  维度 = 客户数 × 3
 
-==================== 瞬时功率预测模型 ====================
+五、项目文件结构
+---------------
 
-模型输入特征 (基于flightTrajectory数据):
-- height: 高度 [m]
-- VS: 竖直速度 [m/s]
-- GS: 地速 [m/s]
-- wind_speed: 风速 [m/s]
-- temperature: 温度 [°C]
-- humidity: 湿度 [%]
-- wind_angle: 风向夹角 [度] (由course和wind_direct计算)
+核心求解模块：
+  mtdrp_energy_model.py      MTDRP问题建模、LSTM-Transformer功率模型、解评估
+  mtdrp_rlts_nsga2.py         RLTS-NSGA-II求解器主程序（直接运行）
 
-模型输出:
-- 瞬时功率 [W]
+模型训练脚本（model_training/）：
+  train_lstm_transformer_model.py   LSTM-Transformer混合模型训练
+  train_bilstm_model.py             Bi-LSTM模型训练
+  train_gru_model.py                GRU Seq2Seq模型训练
+  train_lstm_seq2seq_model.py       LSTM Seq2Seq模型训练
+  train_transformer_model.py        Transformer模型训练
+  train_lstm_fc_model.py            LSTM-FC模型训练
+  train_tcn_model.py                TCN模型训练
+  train_informer_model.py           Informer模型训练
 
-瞬时功率模型对比结果表：
-┌─────────────┬────────────┬────────────┬────────────┬──────┐
-│    模型     │  RMSE (W)  │  MAE (W)   │     R²     │ 排名 │
-├─────────────┼────────────┼────────────┼────────────┼──────┤
-│ 🥇LightGBM树│   339.68   │   254.65   │   0.8426   │ 1st  │
-│ 🥈深度学习  │   510.68   │   394.88   │   0.6442   │ 2nd  │
-│ 🥉线性回归  │   718.27   │   564.55   │   0.2961   │ 3rd  │
-│ 4️⃣物理模型 │  1793.12   │  1653.18   │  -3.3870   │ 4th  │
-└─────────────┴────────────┴────────────┴────────────┴──────┘
+模型评估脚本（model_evaluation/）：
+  evaluate_all_models.py            统一评估所有模型
+  ablation_feature_groups.py        特征消融实验
 
-关键发现：
-1. **LightGBM树模型表现最佳**：R²=0.843，解释了84.3%的功率变化
-2. **深度学习模型表现良好**：R²=0.644，适合复杂非线性关系
-3. **物理模型需要校准**：当前参数与实际数据不匹配，需要根据真实数据调整
-4. **特征重要性排序**：高度 > 竖直速度 > 温度 > 湿度 > 风速 > 地速 > 风向夹角
+训练好的模型文件（result/）：
+  power_lstm_transformer_model.pth  当前主模型（LSTM-Transformer）
+  power_bilstm_v2_model.pth         Bi-LSTM v2
+  power_gru_model.pth               GRU Seq2Seq
+  power_lstm_seq2seq_model.pth      LSTM Seq2Seq
+  power_transformer_model.pth       Transformer
+  power_lstm_fc_model.pth           LSTM-FC
+  power_tcn_model.pth               TCN
+  power_informer_model.pth          Informer
+  各模型对应的 _scalers.pkl         特征标准化参数
 
-训练数据：
-- 数据来源：flightTrajectory.xlsx (UAS04028624, UAS04028648)
-- 训练样本：733,022条轨迹点记录
-- 测试样本：11,423条记录
+数据目录：
+  Drone_energy_dataset/             原始飞行轨迹数据（UAS04028624/48）
+  标准算例/                         标准测试算例（含 test_small_20.dat）
+  Cheng_Instances/                  Cheng et al. 论文原始算例
+  深圳光明实例算例/                 深圳光明区顺丰站点真实案例
 
-文件结构：
-- train_power_tree_model.py: LightGBM瞬时功率模型训练
-- train_power_deep_model.py: PyTorch深度学习模型训练
-- train_power_linear_model.py: 线性回归模型训练
-- evaluate_power_models.py: 模型评估脚本
-- mtdrp_energy_model.py: 功率模型定义和接口
-- mtdrp_rlts_nsga2.py: 物流调度算法（使用功率模型）
+六、快速开始
+-----------
 
-模型文件：
-- result/power_lgb_model.txt: LightGBM模型
-- result/power_pytorch_model.pth: PyTorch模型
-- result/power_linear_model.pkl: 线性回归模型
+6.1 环境要求
+  - Python 3.11+
+  - PyTorch, pygmo, numpy, matplotlib, scikit-learn
+  - 推荐使用 Anaconda 虚拟环境
 
+6.2 运行求解器
+  # 激活虚拟环境后执行：
+  python mtdrp_rlts_nsga2.py
 
+  默认使用 test_small_20.dat（20客户/5无人机）测试实例。
+  求解参数可在主函数中调整：population_size, generations, tabu_frequency 等。
 
-==================== 最新进展 ====================
+6.3 切换功率模型
+  修改 mtdrp_rlts_nsga2.py 中的 POWER_MODEL_TYPE 变量：
+    "lstm_transformer"  → LSTM-Transformer（默认）
+    "bilstm"            → Bi-LSTM
+    "gru"               → GRU Seq2Seq
+    "lstm"              → LSTM Seq2Seq
+    "transformer"       → Transformer
 
-- 2026-06-03：
-  1. 在 `mtdrp_energy_model.py` 中实现多行程无人机模型，并接入 LSTM-Transformer 能耗预测。
-  2. 在 `mtdrp_rlts_nsga2.py` 中整合 RLTS-NSGA-II 求解流程，新增自适应位置编码、能耗缓存与进度日志。
-  3. 默认算例指向 `标准算例/instances/test_small_20.dat`，可以直接运行脚本得到帕累托前沿与可视化结果。
+6.4 训练新模型
+  cd model_training
+  python train_lstm_transformer_model.py
 
+七、输出结果
+-----------
+运行完成后输出：
+  - 控制台：每代耗时、帕累托前沿规模、最优解详情
+  - result/mtdrp_rlts_nsga2_evolution.png  进化曲线（成本/能耗/帕累托规模）
+  - result/mtdrp_rlts_nsga2_routes.png     最优路径可视化
 
-==================== 运行指南 ====================
+八、关键改进点（相对原始论文）
+-----------------------------
+  1. 能耗模型：从简化物理公式升级为 LSTM-Transformer 深度学习预测
+  2. 多行程支持：允许无人机执行多次行程，行程间可更换电池
+  3. 时间窗约束：新增客户时间窗 [e_i, l_i] 约束
+  4. 多目标优化：同时优化总距离和总能耗
+  5. Q-Learning 自适应：动态调整遗传算法参数
+  6. 真实气象数据：集成温度、湿度、风速、风向等低空气象因素
 
-1. **准备环境**
-   ```bash
-   D:/MyApp/Anaconda/envs/pygmo_env/python.exe -m pip install -r requirements.txt
-   ```
-   - 所有运行请保持在该虚拟环境中完成。
-
-2. **求解多行程无人机路径问题**
-   ```bash
-   D:/MyApp/Anaconda/envs/pygmo_env/python.exe mtdrp_rlts_nsga2.py
-   ```
-   - 脚本会自动加载 `标准算例/instances/test_small_20.dat`。
-   - 终端将输出每代耗时、禁忌搜索改进数量以及最终帕累托统计。
-
-3. **结果查看**
-   - 帕累托曲线与最佳路径图保存到 `result/mtdrp_rlts_nsga2_*.png`。
-   - 详细的最优解信息会在命令行最后打印出来。
-
-4. **常见问题**
-   - 如果第一次推送远程失败，可重试或启用 `git push --set-upstream origin <branch>`。
-   - 若 Matplotlib 保存图片时报错，请确认创建 `result/` 目录或使用新的保存路径。
 
