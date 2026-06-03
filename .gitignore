@@ -1,0 +1,37 @@
+# Python缓存与编译产物
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# 虚拟环境与依赖
+.env
+.venv
+env/
+venv/
+
+# IDE/编辑器配置
+.vscode/
+.idea/
+*.code-workspace
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
+
+# 结果图与中间可视化文件
+result/*.png
+result/*.jpg
+result/*.jpeg
+result/*.svg
+
+# 大规模算例数据（无需上传）
+Cheng_Instances/
+深圳光明实例算例/
+
+# 其他本地数据缓存
+data/
+outputs/

@@ -35,333 +35,59 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.rcParams['font.family'] = 'SimHei'
+matplotlib.rcParams['axes.unicode_minus'] = False
 import random
 import copy
-import math
+import time
 from collections import deque
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Tuple
 
 from mtdrp_energy_model import (
-    MTDRPInstance, load_instance, Customer, DroneParameters,
-    create_power_model, MODEL_CONFIGS, estimate_flight_energy,
-    LSTMPowerModel, GRUPowerModel, BiLSTMPowerModel, TransformerPowerModel
+    MTDRPInstance,
+    load_instance,
+    MTDRPModel,
+    MTDRPSolution,
+    build_mtdrp_model,
 )
 
 
 # ==================== 功率模型配置 ====================
 
 # 功率模型选择配置
-# 支持的模型类型: "bilstm"(推荐), "gru", "lstm", "transformer"
-POWER_MODEL_TYPE = "lstm"  
+POWER_MODEL_TYPE = "lstm_transformer"  
 
-# 默认环境参数 (用于能耗估算)
 DEFAULT_HEIGHT = 120.0      # 默认飞行高度 [m]
 DEFAULT_WIND_SPEED = 2.0    # 默认风速 [m/s]
 DEFAULT_TEMPERATURE = 25.0  # 默认温度 [°C]
 DEFAULT_HUMIDITY = 60.0     # 默认湿度 [%]
 DEFAULT_WIND_ANGLE = 90.0   # 默认风向夹角 [度]
+DEFAULT_VERTICAL_SPEED = 3.0  # 默认垂直速度 [m/s]
 BATTERY_SWAP_TIME = 5.0     # 换电池时间 [分钟] - 用于多行程衔接
 
-def create_energy_model(instance: MTDRPInstance):
-    """
-    创建功率预测模型的工厂函数
-    
-    参数:
-        instance: MTDRP问题实例
-        
-    返回:
-        功率预测模型实例
-        
-    支持的模型类型:
-        - bilstm: 双向LSTM模型 (推荐, R²=0.8287)
-        - gru: GRU Seq2Seq模型 (R²=0.8247)
-        - lstm: LSTM Seq2Seq模型 (R²=0.8155)
-        - transformer: Transformer模型 (R²=0.8104)
-    """
-    try:
-        model = create_power_model(POWER_MODEL_TYPE, instance)
-        return model
-    except Exception as e:
-        print(f"[ERROR] 创建 {POWER_MODEL_TYPE} 模型失败: {e}")
-        # 尝试使用默认的 Bi-LSTM 模型作为后备
-        print("[INFO] 尝试使用 Bi-LSTM 模型作为后备...")
-        try:
-            return BiLSTMPowerModel()
-        except Exception as e2:
-            print(f"[ERROR] 后备模型也加载失败: {e2}")
-            raise RuntimeError("无法加载任何功率预测模型，请检查模型文件是否存在")
+
+def create_mtdrp_model(instance: MTDRPInstance) -> MTDRPModel:
+    """创建多行程无人机路径模型，自动加载 LSTM-Transformer 能耗模型"""
+    environment = {
+        'cruise_height': DEFAULT_HEIGHT,
+        'cruise_speed': instance.drone_params.speed,
+        'vertical_speed': DEFAULT_VERTICAL_SPEED,
+        'wind_speed': DEFAULT_WIND_SPEED,
+        'temperature': DEFAULT_TEMPERATURE,
+        'humidity': DEFAULT_HUMIDITY,
+        'wind_angle': DEFAULT_WIND_ANGLE,
+    }
+
+    return build_mtdrp_model(
+        instance=instance,
+        model_type=POWER_MODEL_TYPE,
+        battery_swap_time=BATTERY_SWAP_TIME,
+        environment=environment,
+        energy_weight=1000.0,
+    )
 
 
 # ==================== 解的表示与评估 ====================
-
-class MTDRPSolution:
-    """
-    MTDRP解的表示
-    
-    一个解包含多架无人机的多个行程，每个行程是一个客户访问序列
-    """
-    
-    def __init__(self, instance: MTDRPInstance):
-        self.instance = instance
-        # routes[drone_id] = [trip1, trip2, ...], 每个trip是客户ID列表
-        self.routes: Dict[int, List[List[int]]] = {k: [] for k in range(instance.num_drones)}
-        
-    def add_trip(self, drone_id: int, customers: List[int]):
-        """为无人机添加一个行程"""
-        if customers:
-            self.routes[drone_id].append(customers)
-    
-    def get_all_trips(self) -> List[Tuple[int, int, List[int]]]:
-        """获取所有行程 [(drone_id, trip_idx, customers), ...]"""
-        trips = []
-        for drone_id, drone_trips in self.routes.items():
-            for trip_idx, customers in enumerate(drone_trips):
-                trips.append((drone_id, trip_idx, customers))
-        return trips
-    
-    def get_visited_customers(self) -> set:
-        """获取所有被访问的客户"""
-        visited = set()
-        for drone_trips in self.routes.values():
-            for trip in drone_trips:
-                visited.update(trip)
-        return visited
-    
-    def is_complete(self) -> bool:
-        """检查是否所有客户都被访问"""
-        visited = self.get_visited_customers()
-        required = set(c.id for c in self.instance.customers)
-        return visited == required
-
-
-class MTDRPEvaluator:
-    """
-    MTDRP解的评估器，计算目标函数值和约束违反惩罚
-    
-    """
-    
-    def __init__(self, instance: MTDRPInstance):
-        self.instance = instance
-        self.energy_model = create_energy_model(instance)
-        self.customer_map = {c.id: c for c in instance.customers}
-    
-    def _calculate_arc_energy(self, from_node: int, to_node: int, payload: float) -> Tuple[float, float, float]:
-        """
-        弧能耗函数 - 基于完整航迹的深度学习预测
-        
-        航迹模式: 垂直上升 → 水平巡航 → 垂直下降
-        使用时序深度学习模型预测整条航迹的功率序列，再积分得到能耗
-        
-        参数:
-            from_node: 起始节点
-            to_node: 目标节点
-            payload: 当前载重 q_ij [kg] (保留参数，当前模型未使用)
-            
-        返回:
-            (e_ij, dist, travel_time_minutes): 弧能耗[kWh], 距离[m], 飞行时间[分钟]
-        """
-        dist = self.instance.distance_matrix[from_node, to_node]
-        
-        if dist <= 0:
-            return 0.0, 0.0, 0.0
-        
-        # 使用深度学习模型预测整条弧的能耗
-        # predict_arc_energy 内部会生成完整航迹（上升+巡航+下降）
-        e_ij, total_time_seconds = self.energy_model.predict_arc_energy(
-            distance=dist,
-            cruise_height=DEFAULT_HEIGHT,
-            cruise_speed=self.instance.drone_params.speed,
-            vertical_speed=3.0,  # 垂直速度 3 m/s
-            wind_speed=DEFAULT_WIND_SPEED,
-            temperature=DEFAULT_TEMPERATURE,
-            humidity=DEFAULT_HUMIDITY,
-            wind_angle=DEFAULT_WIND_ANGLE,
-            time_interval=1.0  # 1秒采样间隔
-        )
-        
-        travel_time_minutes = total_time_seconds / 60.0
-        
-        return e_ij, dist, travel_time_minutes
-        
-    def evaluate(self, solution: MTDRPSolution) -> Tuple[float, float, Dict]:
-        """
-        评估解的质量
-        
-        【改进1】多行程时间衔接: 跟踪每架无人机的可用时间
-        
-        返回: (total_cost, total_penalty, details)
-        """
-        total_energy = 0.0
-        total_distance = 0.0
-        total_delay = 0.0
-        penalties = {'unvisited': 0.0, 'capacity': 0.0, 'energy': 0.0, 
-                     'time_window': 0.0, 'duplicate': 0.0, 'energy_midway': 0.0}
-        visited_customers = set()
-        
-        # 【改进4】载重流显式记录
-        arc_payloads = {}  # (from_node, to_node) -> q_ij
-        
-        # 评估每架无人机的每个行程
-        for drone_id, drone_trips in solution.routes.items():
-            # 【改进1】多行程时间衔接: 跟踪无人机可用时间
-            drone_available_time = 0.0
-            
-            for trip_idx, trip in enumerate(drone_trips):
-                # 传入无人机当前可用时间，实现多行程时间连续
-                trip_result = self._evaluate_trip(
-                    trip, 
-                    already_visited=visited_customers,
-                    start_time=drone_available_time,
-                    arc_payloads=arc_payloads
-                )
-                
-                total_energy += trip_result['energy']
-                total_distance += trip_result['distance']
-                total_delay += trip_result['delay']
-                
-                for key in penalties:
-                    penalties[key] += trip_result['penalties'].get(key, 0.0)
-                
-                visited_customers.update(trip)
-                
-                # 【改进1】更新无人机可用时间 = 行程结束时间 + 换电池时间
-                drone_available_time = trip_result['end_time'] + BATTERY_SWAP_TIME
-        
-        # 检查未访问的客户
-        required = set(c.id for c in self.instance.customers)
-        unvisited = required - visited_customers
-        penalties['unvisited'] = len(unvisited) * 10000.0
-        
-        total_penalty = sum(penalties.values())
-        delta = 1.0  # 能量成本系数
-        total_cost = total_distance + delta * total_energy * 1000
-        
-        details = {
-            'total_energy': total_energy,
-            'total_distance': total_distance,
-            'total_delay': total_delay,
-            'penalties': penalties,
-            'num_trips': sum(len(trips) for trips in solution.routes.values()),
-            'visited_customers': len(visited_customers),
-            'unvisited_customers': len(unvisited),
-            'arc_payloads': arc_payloads  # 【改进4】返回载重流记录
-        }
-        
-        return total_cost, total_penalty, details
-    
-    def _evaluate_trip(self, trip: List[int], already_visited: set, 
-                       start_time: float = 0.0, 
-                       arc_payloads: Dict = None) -> Dict:
-        """
-        评估单个行程
-        
-        【改进1】支持指定行程开始时间，实现多行程时间衔接
-        【改进2】使用能量累计变量 f_i 进行逐节点能量检查
-        【改进4】记录每条弧的载重 q_ij
-        
-        参数:
-            trip: 客户ID列表
-            already_visited: 已访问的客户集合
-            start_time: 行程开始时间（用于多行程衔接）
-            arc_payloads: 弧载重记录字典
-        """
-        result = {'energy': 0.0, 'distance': 0.0, 'delay': 0.0, 
-                  'end_time': start_time, 'penalties': {}}
-        
-        if not trip:
-            return result
-        
-        if arc_payloads is None:
-            arc_payloads = {}
-        
-        # 检查重复访问
-        for cust_id in trip:
-            if cust_id in already_visited:
-                result['penalties']['duplicate'] = result['penalties'].get('duplicate', 0) + 5000.0
-        
-        # 计算初始载重
-        total_demand = sum(self.customer_map[cid].demand for cid in trip if cid in self.customer_map)
-        
-        # 检查载重约束
-        if total_demand > self.instance.drone_params.Q:
-            result['penalties']['capacity'] = (total_demand - self.instance.drone_params.Q) * 1000.0
-        
-        # 模拟行程
-        current_node = 0  # depot
-        current_time = start_time  # 【改进1】使用传入的开始时间
-        current_payload = total_demand
-        
-        # 【改进2】能量累计变量 f_i: f[0] = 0 表示从仓库出发时满电
-        f = [0.0]  # 累计能耗列表
-        trip_distance = 0.0
-        
-        for cust_id in trip:
-            if cust_id not in self.customer_map:
-                continue
-            customer = self.customer_map[cust_id]
-            cust_idx = cust_id
-            
-            # 【改进4】记录弧载重 q_ij
-            arc_payloads[(current_node, cust_idx)] = current_payload
-            
-            # 【改进3】使用封装的弧能耗函数
-            e_ij, dist, travel_time = self._calculate_arc_energy(
-                current_node, cust_idx, current_payload
-            )
-            
-            # 【改进2】累计能量: f[i] = f[i-1] + e_{i-1,i}
-            f.append(f[-1] + e_ij)
-            trip_distance += dist
-            
-            # 【改进2】检查是否中途超过电池容量
-            if f[-1] > self.instance.drone_params.sigma:
-                excess = f[-1] - self.instance.drone_params.sigma
-                result['penalties']['energy_midway'] = result['penalties'].get('energy_midway', 0) + excess * 5000.0
-            
-            # 更新时间
-            arrival_time = current_time + travel_time
-            if arrival_time < customer.earliest_time:
-                current_time = customer.earliest_time + customer.service_time
-            elif arrival_time > customer.latest_time:
-                delay = arrival_time - customer.latest_time
-                result['delay'] += delay
-                result['penalties']['time_window'] = result['penalties'].get('time_window', 0) + delay * 100.0
-                current_time = arrival_time + customer.service_time
-            else:
-                current_time = arrival_time + customer.service_time
-            
-            # 卸货后更新载重
-            current_payload -= customer.demand
-            current_node = cust_idx
-        
-        # 返回depot
-        # 【改进4】记录返回depot的弧载重（应为0）
-        arc_payloads[(current_node, 0)] = current_payload
-        
-        # 【改进3】使用封装的弧能耗函数
-        e_to_depot, dist_to_depot, travel_time_to_depot = self._calculate_arc_energy(
-            current_node, 0, current_payload
-        )
-        
-        # 【改进2】累计能量
-        f.append(f[-1] + e_to_depot)
-        trip_distance += dist_to_depot
-        
-        # 更新结束时间
-        current_time += travel_time_to_depot
-        
-        # 【改进2】检查最终能量约束 f_{n+1} <= sigma
-        trip_energy = f[-1]
-        if trip_energy > self.instance.drone_params.sigma:
-            result['penalties']['energy'] = (trip_energy - self.instance.drone_params.sigma) * 10000.0
-        
-        result['energy'] = trip_energy
-        result['distance'] = trip_distance
-        result['end_time'] = current_time  # 【改进1】返回行程结束时间
-        result['cumulative_energy'] = f  # 【改进2】返回累计能量序列
-        
-        return result
+# 解的表示与能耗评估由 mtdrp_energy_model 模块中的 MTDRPSolution / MTDRPModel 提供
 
 
 # ==================== Q-Learning 控制器 ====================
@@ -649,8 +375,7 @@ class MTDRPProblem:
     
     def __init__(self, instance: MTDRPInstance):
         self.instance = instance
-        self.evaluator = MTDRPEvaluator(instance)
-        self.energy_model = create_energy_model(instance)
+        self.model = create_mtdrp_model(instance)
         
         self.n_customers = instance.num_customers
         self.n_drones = instance.num_drones
@@ -776,7 +501,7 @@ class MTDRPProblem:
         """
         try:
             solution = self._decode_solution(np.array(x))
-            cost, penalty, details = self.evaluator.evaluate(solution)
+            objective_cost, penalty, details = self.model.evaluate(solution)
             
             # 目标1: 总飞行距离 + 惩罚
             obj1 = details['total_distance'] + penalty
@@ -869,6 +594,7 @@ def solve_mtdrp_rlts_nsga2(instance: MTDRPInstance,
     
     # 进化循环
     for gen in range(generations):
+        gen_start = time.time()
         # Q-learning参数调节
         if qlearning is not None:
             current_fitness = pop.get_f()
@@ -921,6 +647,11 @@ def solve_mtdrp_rlts_nsga2(instance: MTDRPInstance,
         evolution_data['avg_energy'].append(np.mean(energies))
         evolution_data['pareto_count'].append(len(pareto_indices))
         
+        elapsed = time.time() - gen_start
+
+        if verbose:
+            print(f"第{gen+1}代耗时: {elapsed:.2f} 秒")
+
         # 打印进度
         if verbose and (gen + 1) % 10 == 0:
             print(f"第{gen+1:3d}代 | "
@@ -936,12 +667,12 @@ def solve_mtdrp_rlts_nsga2(instance: MTDRPInstance,
     pareto_front = []
     for idx in pareto_indices:
         solution = problem._decode_solution(final_individuals[idx])
-        cost, penalty, details = problem.evaluator.evaluate(solution)
+        objective_cost, penalty, details = problem.model.evaluate(solution)
         
         pareto_front.append({
             'individual': final_individuals[idx],
             'fitness': final_fitness[idx],
-            'cost': cost,
+            'cost': objective_cost + penalty,
             'energy': details['total_energy'],
             'distance': details['total_distance'],
             'num_trips': details['num_trips'],
@@ -974,7 +705,12 @@ def visualize_mtdrp_results(result: Dict, instance: MTDRPInstance,
     可视化MTDRP求解结果
     """
     import os
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else "result", exist_ok=True)
+    # 构建规范的绝对路径，避免 Windows 下正斜杠导致的 Errno 22
+    save_dir = os.path.dirname(os.path.abspath(save_path)) if os.path.dirname(save_path) else os.path.abspath(".")
+    os.makedirs(save_dir, exist_ok=True)
+    base_name = os.path.basename(save_path)
+    evolution_png = os.path.join(save_dir, f"{base_name}_evolution.png")
+    routes_png = os.path.join(save_dir, f"{base_name}_routes.png")
     
     import matplotlib
     matplotlib.rcParams['font.family'] = 'SimHei'
@@ -1026,22 +762,29 @@ def visualize_mtdrp_results(result: Dict, instance: MTDRPInstance,
         ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f"{save_path}_evolution.png", dpi=300, bbox_inches='tight')
+    plt.savefig(evolution_png, dpi=300, bbox_inches='tight')
+    print(f"[OK] 进化曲线已保存: {evolution_png}")
     plt.show()
     
     # 图2: 最优解的路径可视化
     if pareto_front:
         best_solution = min(pareto_front, key=lambda x: x['cost'])
-        visualize_routes(best_solution['solution'], instance, f"{save_path}_routes.png")
+        visualize_routes(best_solution['solution'], instance, routes_png)
 
 
 def visualize_routes(solution: MTDRPSolution, instance: MTDRPInstance, save_path: str):
     """
     可视化无人机路径
     """
+    import os
     import matplotlib
     matplotlib.rcParams['font.family'] = 'SimHei'
     matplotlib.rcParams['axes.unicode_minus'] = False
+    
+    # 确保保存目录存在
+    save_dir = os.path.dirname(os.path.abspath(save_path))
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     
     plt.figure(figsize=(12, 10))
     
@@ -1088,6 +831,7 @@ def visualize_routes(solution: MTDRPSolution, instance: MTDRPInstance, save_path
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"[OK] 路径图已保存: {save_path}")
     plt.show()
 
 
@@ -1096,7 +840,7 @@ if __name__ == "__main__":
     import os
     
     # 加载测试实例
-    test_file = "Order_demand_dataset/instances/test_small_20.dat"
+    test_file = "标准算例/instances/test_small_20.dat"
     
     if os.path.exists(test_file):
         print("加载MTDRP问题实例...")
@@ -1109,9 +853,9 @@ if __name__ == "__main__":
         # 使用RLTS-NSGA-II求解
         result = solve_mtdrp_rlts_nsga2(
             instance,
-            population_size=100,
-            generations=50,  # 测试用较少代数
-            tabu_frequency=10,
+            population_size=30,
+            generations=10,
+            tabu_frequency=5,
             tabu_intensity=0.3,
             enable_qlearning=True,
             verbose=True

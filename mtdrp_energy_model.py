@@ -2,23 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-多行程无人机路径问题 (MTDRP) - 时序功率预测模型
+多行程无人机路径问题 (MTDRP) - LSTM-Transformer 功率预测模型
 
 基于论文: "Drone routing with energy function: Formulation and exact algorithm"
 
 核心特点:
-1. 瞬时功率预测: 基于深度学习模型利用时序特征预测功率序列
+1. 瞬时功率预测: 基于LSTM-Transformer混合模型利用时序特征预测功率序列
 2. 多行程支持: 无人机可返回配送中心换电池后继续执行任务
 3. 时间窗约束: 每个客户有到达时间窗 [a_i, b_i]
 4. 载重约束: 无人机最大载重限制 Q
 
-支持的模型类型 (按性能排序):
-- bilstm: 双向LSTM模型 (推荐，R²=0.8287)
-- gru: GRU Seq2Seq模型 (R²=0.8247)
-- lstm: LSTM Seq2Seq模型 (R²=0.8155)
-- transformer: Transformer模型 (R²=0.8104)
-
-模型输入特征序列 (每个时刻7个特征):
+模型输入特征序列 (每个时刻8个特征):
 - Height: 高度 [m]
 - VS: 竖直速度 [m/s]
 - GS: 地速 [m/s]
@@ -26,6 +20,7 @@
 - Temperature: 温度 [°C]
 - Humidity: 湿度 [%]
 - wind_angle: 风向夹角 [度]
+- payload: 当前载重 [kg]
 
 模型输出: 瞬时功率序列 [W]
 
@@ -36,7 +31,7 @@ import numpy as np
 import math
 import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import pickle
 
 # 尝试导入PyTorch
@@ -202,245 +197,65 @@ def load_instance(filepath: str) -> MTDRPInstance:
     )
 
 
-# ==================== LSTM Seq2Seq 模型定义 ====================
-
-class LSTMEncoder(nn.Module):
-    """LSTM编码器"""
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMEncoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-        
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        outputs, (hidden, cell) = self.lstm(x)
-        return outputs, hidden, cell
-
-
-class LSTMDecoder(nn.Module):
-    """LSTM解码器"""
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(LSTMDecoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_directions = 2 if bidirectional else 1
-        
-        decoder_input_size = hidden_size * self.num_directions
-        
-        self.lstm = nn.LSTM(
-            input_size=decoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-        
-        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden, cell):
-        decoder_outputs, _ = self.lstm(encoder_outputs, (hidden, cell))
-        outputs = self.fc(decoder_outputs)
-        return outputs.squeeze(-1)
-
-
-class LSTMSeq2Seq(nn.Module):
-    """LSTM Seq2Seq 完整模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
-                 dropout=0.2, bidirectional=True):
-        super(LSTMSeq2Seq, self).__init__()
-        
-        self.encoder = LSTMEncoder(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-        
-        self.decoder = LSTMDecoder(
-            hidden_size=hidden_size,
-            output_size=1,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        encoder_outputs, hidden, cell = self.encoder(x)
-        outputs = self.decoder(encoder_outputs, hidden, cell)
-        return outputs
-
-
-# ==================== GRU Seq2Seq 模型定义 ====================
-
-class GRUEncoder(nn.Module):
-    """GRU编码器"""
-    def __init__(self, input_size, hidden_size, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUEncoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-        
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        outputs, hidden = self.gru(x)
-        return outputs, hidden
-
-
-class GRUDecoder(nn.Module):
-    """GRU解码器"""
-    def __init__(self, hidden_size, output_size=1, num_layers=2, dropout=0.2, bidirectional=True):
-        super(GRUDecoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_directions = 2 if bidirectional else 1
-        
-        decoder_input_size = hidden_size * self.num_directions
-        
-        self.gru = nn.GRU(
-            input_size=decoder_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
-        
-        self.fc = nn.Linear(hidden_size * self.num_directions, output_size)
-    
-    def forward(self, encoder_outputs, hidden):
-        decoder_outputs, _ = self.gru(encoder_outputs, hidden)
-        outputs = self.fc(decoder_outputs)
-        return outputs.squeeze(-1)
-
-
-class GRUSeq2Seq(nn.Module):
-    """GRU Seq2Seq 完整模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=2, 
-                 dropout=0.2, bidirectional=True):
-        super(GRUSeq2Seq, self).__init__()
-        
-        self.encoder = GRUEncoder(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-        
-        self.decoder = GRUDecoder(
-            hidden_size=hidden_size,
-            output_size=1,
-            num_layers=num_layers,
-            dropout=dropout,
-            bidirectional=bidirectional
-        )
-    
-    def forward(self, x):
-        encoder_outputs, hidden = self.encoder(x)
-        outputs = self.decoder(encoder_outputs, hidden)
-        return outputs
-
-
-# ==================== Bi-LSTM 模型定义 ====================
-
-class BiLSTMModel(nn.Module):
-    """双向LSTM功率预测模型"""
-    def __init__(self, input_size=7, hidden_size=128, num_layers=3, dropout=0.3):
-        super(BiLSTMModel, self).__init__()
-        
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # 双向LSTM层
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=True
-        )
-        
-        # 注意力机制
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
-        )
-        
-        # 输出层
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1)
-        )
-    
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        output = self.fc(lstm_out)
-        return output.squeeze(-1)
-
-
-# ==================== Transformer 模型定义 ====================
+# ==================== LSTM-Transformer 混合模型定义 ====================
 
 class PositionalEncoding(nn.Module):
-    """位置编码"""
-    def __init__(self, d_model, max_len=5000, dropout=0.1):
+    """正弦位置编码（自适应序列长度）"""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
         super(PositionalEncoding, self).__init__()
+        self.d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(1)
+        device = x.device
+        dtype = x.dtype
+
+        position = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=device, dtype=dtype) * (-math.log(10000.0) / self.d_model)
+        )
+
+        pe = torch.zeros(seq_len, self.d_model, device=device, dtype=dtype)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
-        
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
+
+        x = x + pe
         return self.dropout(x)
 
 
-class TransformerModel(nn.Module):
-    """Transformer功率预测模型"""
-    def __init__(self, input_size=7, d_model=128, nhead=8, num_layers=4, 
-                 dim_feedforward=512, dropout=0.1, max_len=500):
-        super(TransformerModel, self).__init__()
+class LSTMTransformerModel(nn.Module):
+    """
+    LSTM-Transformer 串行混合模型
+    
+    架构: 输入(8特征) → 线性映射 → 双向LSTM → 位置编码 → Transformer编码器 → 输出
+    """
+    def __init__(self, input_size=8, d_model=256, lstm_layers=2,
+                 nhead=8, num_transformer_layers=3, dim_feedforward=512,
+                 dropout=0.1, max_len=500):
+        super(LSTMTransformerModel, self).__init__()
         
         self.d_model = d_model
         
-        # 输入嵌入层
+        # 1. 输入映射层
         self.input_embedding = nn.Linear(input_size, d_model)
         
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
+        # 2. 双向LSTM（hidden * 2 = d_model）
+        self.lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=d_model // 2,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0,
+            bidirectional=True
+        )
         
-        # Transformer编码器层
+        # 3. 位置编码
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        
+        # 4. Transformer编码器
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -448,9 +263,9 @@ class TransformerModel(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
         
-        # 输出层
+        # 5. 输出层
         self.output_layer = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
@@ -459,7 +274,10 @@ class TransformerModel(nn.Module):
         )
     
     def forward(self, x, src_key_padding_mask=None):
-        x = self.input_embedding(x) * math.sqrt(self.d_model)
+        """前向传播: 输入 → LSTM → Transformer → 输出"""
+        x = self.input_embedding(x)
+        x, _ = self.lstm(x)
+        x = x * math.sqrt(self.d_model)
         x = self.pos_encoder(x)
         x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
         output = self.output_layer(x)
@@ -476,9 +294,9 @@ class BasePowerModel:
         self.model = None
         self.feature_scaler = None
         self.target_scaler = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.feature_names = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed', 
-                             'Temperature', 'Humidity', 'wind_angle']
+        self.device = torch.device('cpu')  # 推理统一使用CPU，避免MTDRP高频调用时GPU-CPU设备不匹配
+        self.feature_names = ['Height', 'VS (m/s)', 'GS (m/s)', 'Wind Speed',
+                             'Temperature', 'Humidity', 'wind_angle', 'payload']
     
     def _load_scalers(self):
         """加载标准化器"""
@@ -494,7 +312,7 @@ class BasePowerModel:
         预测功率序列
         
         参数:
-            feature_sequence: N×7 特征矩阵 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle]
+            feature_sequence: N×8 特征矩阵 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle, Payload]
             
         返回:
             N维功率序列 [W]
@@ -503,9 +321,9 @@ class BasePowerModel:
             feature_sequence = self.feature_scaler.transform(feature_sequence)
         
         with torch.no_grad():
-            input_tensor = torch.FloatTensor(feature_sequence).unsqueeze(0).to(self.device)
+            input_tensor = torch.FloatTensor(feature_sequence).unsqueeze(0)  # 始终在CPU上推理
             output = self.model(input_tensor)
-            power_sequence = output.squeeze(0).cpu().numpy()
+            power_sequence = output.squeeze(0).numpy()
         
         if self.target_scaler is not None:
             power_sequence = self.target_scaler.inverse_transform(
@@ -514,7 +332,7 @@ class BasePowerModel:
         
         return np.maximum(0.0, power_sequence)
     
-    def generate_arc_trajectory(self, distance: float, 
+    def generate_arc_trajectory(self, distance: float,
                                 cruise_height: float = 120.0,
                                 cruise_speed: float = 10.0,
                                 vertical_speed: float = 3.0,
@@ -522,26 +340,12 @@ class BasePowerModel:
                                 temperature: float = 25.0,
                                 humidity: float = 60.0,
                                 wind_angle: float = 90.0,
+                                payload: float = 0.0,
                                 time_interval: float = 1.0) -> np.ndarray:
         """
         生成弧航迹的特征序列
         
         航迹模式: 垂直上升 → 水平巡航 → 垂直下降
-        
-        阶段1 - 垂直上升:
-            - Height: 0 → cruise_height (线性增加)
-            - VS: +vertical_speed (正值表示上升)
-            - GS: 0 (无水平移动)
-            
-        阶段2 - 水平巡航:
-            - Height: cruise_height (恒定)
-            - VS: 0
-            - GS: cruise_speed
-            
-        阶段3 - 垂直下降:
-            - Height: cruise_height → 0 (线性减少)
-            - VS: -vertical_speed (负值表示下降)
-            - GS: 0 (无水平移动)
         
         参数:
             distance: 水平飞行距离 [m]
@@ -552,57 +356,43 @@ class BasePowerModel:
             temperature: 温度 [°C]
             humidity: 湿度 [%]
             wind_angle: 风向夹角 [度]
+            payload: 当前载重 [kg]（整条弧载重不变）
             time_interval: 采样间隔 [秒]
             
         返回:
-            N×7 特征矩阵，每行 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle]
+            N×8 特征矩阵，每行 [Height, VS, GS, WindSpeed, Temp, Humidity, WindAngle, Payload]
         """
         trajectory_points = []
         
         # 阶段1: 垂直上升
-        climb_time = cruise_height / vertical_speed  # 上升所需时间 [秒]
+        climb_time = cruise_height / vertical_speed
         climb_steps = max(1, int(climb_time / time_interval))
         for i in range(climb_steps):
             t = i * time_interval
             height = min(cruise_height, t * vertical_speed)
             trajectory_points.append([
-                height,           # Height
-                vertical_speed,   # VS (正值=上升)
-                0.0,              # GS (无水平移动)
-                wind_speed,
-                temperature,
-                humidity,
-                wind_angle
+                height, vertical_speed, 0.0,
+                wind_speed, temperature, humidity, wind_angle, payload
             ])
         
         # 阶段2: 水平巡航
-        cruise_time = distance / cruise_speed  # 巡航所需时间 [秒]
+        cruise_time = distance / cruise_speed
         cruise_steps = max(1, int(cruise_time / time_interval))
         for i in range(cruise_steps):
             trajectory_points.append([
-                cruise_height,    # Height (恒定)
-                0.0,              # VS (无垂直移动)
-                cruise_speed,     # GS
-                wind_speed,
-                temperature,
-                humidity,
-                wind_angle
+                cruise_height, 0.0, cruise_speed,
+                wind_speed, temperature, humidity, wind_angle, payload
             ])
         
         # 阶段3: 垂直下降
-        descent_time = cruise_height / vertical_speed  # 下降所需时间 [秒]
+        descent_time = cruise_height / vertical_speed
         descent_steps = max(1, int(descent_time / time_interval))
         for i in range(descent_steps):
             t = i * time_interval
             height = max(0.0, cruise_height - t * vertical_speed)
             trajectory_points.append([
-                height,            # Height
-                -vertical_speed,   # VS (负值=下降)
-                0.0,               # GS (无水平移动)
-                wind_speed,
-                temperature,
-                humidity,
-                wind_angle
+                height, -vertical_speed, 0.0,
+                wind_speed, temperature, humidity, wind_angle, payload
             ])
         
         return np.array(trajectory_points)
@@ -615,18 +405,36 @@ class BasePowerModel:
                           temperature: float = 25.0,
                           humidity: float = 60.0,
                           wind_angle: float = 90.0,
+                          payload: float = 0.0,
                           time_interval: float = 1.0) -> Tuple[float, float]:
         """
         预测一条弧的总能耗
         
         参数:
             distance: 水平飞行距离 [m]
+            payload: 当前载重 [kg]
             其他参数同 generate_arc_trajectory
             
         返回:
             (energy_kwh, total_time_seconds): 总能耗[kWh], 总飞行时间[秒]
         """
-        # 生成航迹特征序列
+        cache_key = self._make_cache_key(
+            distance,
+            cruise_height,
+            cruise_speed,
+            vertical_speed,
+            wind_speed,
+            temperature,
+            humidity,
+            wind_angle,
+            payload,
+            time_interval,
+        )
+
+        if cache_key in self._arc_cache:
+            return self._arc_cache[cache_key]
+
+        # 生成航迹特征序列（含 payload 第8列）
         trajectory = self.generate_arc_trajectory(
             distance=distance,
             cruise_height=cruise_height,
@@ -636,6 +444,7 @@ class BasePowerModel:
             temperature=temperature,
             humidity=humidity,
             wind_angle=wind_angle,
+            payload=payload,
             time_interval=time_interval
         )
         
@@ -647,7 +456,10 @@ class BasePowerModel:
         total_energy_wh = np.sum(power_sequence) * time_interval / 3600.0
         energy_kwh = total_energy_wh / 1000.0
         
-        return energy_kwh, total_time_seconds
+        result = (energy_kwh, total_time_seconds)
+        # 缓存计算结果，避免重复推理
+        self._arc_cache[cache_key] = result
+        return result
     
     def calculate_sequence_energy(self, power_sequence: np.ndarray, 
                                   time_interval: float = 1.0) -> float:
@@ -656,262 +468,108 @@ class BasePowerModel:
         return total_energy_wh / 1000.0
 
 
-# ==================== LSTM Seq2Seq 功率预测模型 ====================
+# ==================== LSTM-Transformer 功率预测模型 ====================
 
-class LSTMPowerModel(BasePowerModel):
-    """基于LSTM Seq2Seq的瞬时功率预测模型"""
+class LSTMTransformerPowerModel(BasePowerModel):
+    """基于LSTM-Transformer混合模型的瞬时功率预测模型"""
     
-    def __init__(self, model_path: str = 'result/power_lstm_seq2seq_model.pth'):
+    def __init__(self, model_path: str = 'result/power_lstm_transformer_model.pth'):
         super().__init__(model_path)
+        self._arc_cache: Dict[Tuple[float, ...], Tuple[float, float]] = {}
         self._load_model()
+
+    def _make_cache_key(self,
+                         distance: float,
+                         cruise_height: float,
+                         cruise_speed: float,
+                         vertical_speed: float,
+                         wind_speed: float,
+                         temperature: float,
+                         humidity: float,
+                         wind_angle: float,
+                         payload: float,
+                         time_interval: float) -> Tuple[float, ...]:
+        return (
+            round(distance, 2),
+            round(cruise_height, 1),
+            round(cruise_speed, 2),
+            round(vertical_speed, 2),
+            round(wind_speed, 2),
+            round(temperature, 1),
+            round(humidity, 1),
+            round(wind_angle, 1),
+            round(payload, 2),
+            round(time_interval, 2),
+        )
     
     def _load_model(self):
-        """加载训练好的LSTM Seq2Seq模型"""
+        """加载训练好的LSTM-Transformer模型"""
         if not PYTORCH_AVAILABLE:
             print("[WARNING] PyTorch不可用")
             return
             
         try:
             if os.path.exists(self.model_path):
-                # 统一参数配置（与训练脚本保持一致）
-                self.model = LSTMSeq2Seq(
-                    input_size=7,
-                    hidden_size=256,     # 统一为256
-                    num_layers=3,        # 统一为3
-                    dropout=0.2,
-                    bidirectional=True
+                self.model = LSTMTransformerModel(
+                    input_size=8,          # 8个特征（含 payload）
+                    d_model=256,
+                    lstm_layers=2,
+                    nhead=8,
+                    num_transformer_layers=3,
+                    dim_feedforward=512,
+                    dropout=0.1,
+                    max_len=500
                 )
                 
-                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.model.to(self.device)
-                self.model.eval()
-                
-                # 消除 cuDNN 内存警告
-                self.model.encoder.lstm.flatten_parameters()
-                self.model.decoder.lstm.flatten_parameters()
-                
-                self._load_scalers()
-                print(f"[OK] LSTM Seq2Seq功率模型加载成功: {self.model_path}")
-            else:
-                print(f"[WARNING] 模型文件不存在: {self.model_path}")
-        except Exception as e:
-            print(f"[ERROR] 加载LSTM模型失败: {e}")
-
-
-# ==================== GRU Seq2Seq 功率预测模型 ====================
-
-class GRUPowerModel(BasePowerModel):
-    """基于GRU Seq2Seq的瞬时功率预测模型"""
-    
-    def __init__(self, model_path: str = 'result/power_gru_model.pth'):
-        super().__init__(model_path)
-        self._load_model()
-    
-    def _load_model(self):
-        """加载训练好的GRU Seq2Seq模型"""
-        if not PYTORCH_AVAILABLE:
-            print("[WARNING] PyTorch不可用")
-            return
-            
-        try:
-            if os.path.exists(self.model_path):
-                # 统一参数配置（与训练脚本保持一致）
-                self.model = GRUSeq2Seq(
-                    input_size=7,
-                    hidden_size=256,     # 统一为256
-                    num_layers=3,        # 统一为3
-                    dropout=0.2,
-                    bidirectional=True
-                )
-                
-                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.model.to(self.device)
-                self.model.eval()
-                
-                # 消除 cuDNN 内存警告
-                self.model.encoder.gru.flatten_parameters()
-                self.model.decoder.gru.flatten_parameters()
-                
-                self._load_scalers()
-                print(f"[OK] GRU Seq2Seq功率模型加载成功: {self.model_path}")
-            else:
-                print(f"[WARNING] 模型文件不存在: {self.model_path}")
-        except Exception as e:
-            print(f"[ERROR] 加载GRU模型失败: {e}")
-
-
-# ==================== Bi-LSTM 功率预测模型 ====================
-
-class BiLSTMPowerModel(BasePowerModel):
-    """基于Bi-LSTM的瞬时功率预测模型"""
-    
-    def __init__(self, model_path: str = 'result/power_bilstm_v2_model.pth'):
-        super().__init__(model_path)
-        self._load_model()
-    
-    def _load_model(self):
-        """加载训练好的Bi-LSTM模型"""
-        if not PYTORCH_AVAILABLE:
-            print("[WARNING] PyTorch不可用")
-            return
-            
-        try:
-            if os.path.exists(self.model_path):
-                # 统一参数配置（与训练脚本保持一致）
-                self.model = BiLSTMModel(
-                    input_size=7,
-                    hidden_size=256,     # 统一为256
-                    num_layers=3,
-                    dropout=0.2          # 统一为0.2
-                )
-                
-                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.model.to(self.device)
+                checkpoint = torch.load(self.model_path, map_location='cpu')
+                state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
+                missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+                if unexpected:
+                    print(f"[WARN] 忽略未匹配权重: {unexpected}")
+                if missing:
+                    print(f"[WARN] 未找到权重: {missing}")
+                self.model.cpu()
                 self.model.eval()
                 
                 # 消除 cuDNN 内存警告
                 self.model.lstm.flatten_parameters()
                 
                 self._load_scalers()
-                print(f"[OK] Bi-LSTM功率模型加载成功: {self.model_path}")
+                print(f"[OK] LSTM-Transformer功率模型加载成功: {self.model_path}")
             else:
                 print(f"[WARNING] 模型文件不存在: {self.model_path}")
         except Exception as e:
-            print(f"[ERROR] 加载Bi-LSTM模型失败: {e}")
-
-
-# ==================== Transformer 功率预测模型 ====================
-
-class TransformerPowerModel(BasePowerModel):
-    """基于Transformer的瞬时功率预测模型"""
-    
-    def __init__(self, model_path: str = 'result/power_transformer_model.pth'):
-        super().__init__(model_path)
-        self._load_model()
-    
-    def _load_model(self):
-        """加载训练好的Transformer模型"""
-        if not PYTORCH_AVAILABLE:
-            print("[WARNING] PyTorch不可用")
-            return
-            
-        try:
-            if os.path.exists(self.model_path):
-                # 统一参数配置（与训练脚本保持一致）
-                self.model = TransformerModel(
-                    input_size=7,
-                    d_model=256,         # 统一为256
-                    nhead=8,
-                    num_layers=3,        # 统一为3
-                    dim_feedforward=1024,# 4倍d_model
-                    dropout=0.2,         # 统一为0.2
-                    max_len=500
-                )
-                
-                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.model.to(self.device)
-                self.model.eval()
-                
-                self._load_scalers()
-                print(f"[OK] Transformer功率模型加载成功: {self.model_path}")
-            else:
-                print(f"[WARNING] 模型文件不存在: {self.model_path}")
-        except Exception as e:
-            print(f"[ERROR] 加载Transformer模型失败: {e}")
+            print(f"[ERROR] 加载LSTM-Transformer模型失败: {e}")
 
 
 # ==================== 模型工厂函数 ====================
 
-# 模型配置信息
-MODEL_CONFIGS = {
-    'lstm': {
-        'name': 'LSTM Seq2Seq',
-        'class': 'LSTMPowerModel',
-        'path': 'result/power_lstm_seq2seq_model.pth',
-        'r2': 0.8155,
-        'description': '编码器-解码器结构的LSTM模型'
-    },
-    'gru': {
-        'name': 'GRU Seq2Seq',
-        'class': 'GRUPowerModel',
-        'path': 'result/power_gru_model.pth',
-        'r2': 0.8247,
-        'description': '编码器-解码器结构的GRU模型'
-    },
-    'bilstm': {
-        'name': 'Bi-LSTM',
-        'class': 'BiLSTMPowerModel',
-        'path': 'result/power_bilstm_v2_model.pth',
-        'r2': 0.8287,
-        'description': '双向LSTM模型（推荐）'
-    },
-    'transformer': {
-        'name': 'Transformer',
-        'class': 'TransformerPowerModel',
-        'path': 'result/power_transformer_model.pth',
-        'r2': 0.8104,
-        'description': '基于自注意力机制的Transformer模型'
-    }
-}
-
-
-def create_power_model(model_type: str = "bilstm", instance: 'MTDRPInstance' = None):
+def create_power_model(model_type: str = "lstm_transformer", instance: 'MTDRPInstance' = None):
     """
     创建瞬时功率预测模型的工厂函数
     
-    参数:
-        model_type: 模型类型 ("lstm", "gru", "bilstm", "transformer")
-                   默认使用 bilstm（性能最佳）
-        instance: MTDRP问题实例（保留参数，当前未使用）
-        
-    返回:
-        瞬时功率预测模型实例
-        
-    模型性能对比 (test_data测试集):
-        | 模型        | R²     | RMSE (W) | MAE (W) |
-        |-------------|--------|----------|---------|
-        | Bi-LSTM     | 0.8287 | 397.78   | 291.08  |
-        | GRU         | 0.8247 | 402.50   | 295.57  |
-        | LSTM        | 0.8155 | 412.86   | 305.24  |
-        | Transformer | 0.8104 | 418.51   | 292.74  |
+    当前唯一支持的模型类型: "lstm_transformer"
+    输入特征: 8个 (Height, VS, GS, WindSpeed, Temp, Humidity, wind_angle, payload)
     """
     model_type = model_type.lower()
     
-    if model_type == "lstm":
-        print("[OK] 使用 LSTM Seq2Seq 功率预测模型 (R^2=0.8155)")
-        return LSTMPowerModel()
-    
-    elif model_type == "gru":
-        print("[OK] 使用 GRU Seq2Seq 功率预测模型 (R^2=0.8247)")
-        return GRUPowerModel()
-    
-    elif model_type == "bilstm":
-        print("[OK] 使用 Bi-LSTM 功率预测模型 (推荐, R^2=0.8287)")
-        return BiLSTMPowerModel()
-    
-    elif model_type == "transformer":
-        print("[OK] 使用 Transformer 功率预测模型 (R^2=0.8104)")
-        return TransformerPowerModel()
-    
+    if model_type in ("lstm_transformer", "lstm-transformer"):
+        print("[OK] 使用 LSTM-Transformer 功率预测模型")
+        return LSTMTransformerPowerModel()
     else:
-        supported = list(MODEL_CONFIGS.keys())
-        raise ValueError(f"不支持的模型类型: {model_type}. 支持: {supported}")
+        raise ValueError(f"不支持的模型类型: {model_type}。当前唯一支持 'lstm_transformer'")
 
 
 # ==================== 能耗计算辅助函数 ====================
 
-def calculate_trip_energy(power_model: LSTMPowerModel, trajectory_points: List[Dict], 
+def calculate_trip_energy(power_model: LSTMTransformerPowerModel, trajectory_points: List[Dict],
                          time_interval: float = 1.0) -> float:
     """
-    根据轨迹点序列计算总能耗（利用LSTM序列预测）
+    根据轨迹点序列计算总能耗
     
     参数:
-        power_model: LSTM功率预测模型
-        trajectory_points: 轨迹点列表，每个点包含 {height, VS, GS, wind_speed, temperature, humidity, wind_angle}
+        power_model: LSTM-Transformer功率预测模型
+        trajectory_points: 轨迹点列表，每个点包含 {height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload}
         time_interval: 采样时间间隔 [秒]
         
     返回:
@@ -920,7 +578,7 @@ def calculate_trip_energy(power_model: LSTMPowerModel, trajectory_points: List[D
     if not trajectory_points:
         return 0.0
     
-    # 构建特征序列
+    # 构建特征序列（含 payload 第8列）
     feature_sequence = np.array([
         [
             point.get('height', 100.0),
@@ -929,76 +587,56 @@ def calculate_trip_energy(power_model: LSTMPowerModel, trajectory_points: List[D
             point.get('wind_speed', 2.0),
             point.get('temperature', 25.0),
             point.get('humidity', 60.0),
-            point.get('wind_angle', 90.0)
+            point.get('wind_angle', 90.0),
+            point.get('payload', 0.0)
         ]
         for point in trajectory_points
     ])
     
-    # 使用LSTM预测功率序列
     power_sequence = power_model.predict_power_sequence(feature_sequence)
-    
-    # 计算总能耗
-    total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
-    
-    return total_energy
+    return power_model.calculate_sequence_energy(power_sequence, time_interval)
 
 
-def estimate_flight_energy(power_model: LSTMPowerModel, distance: float, speed: float = 10.0,
-                          height: float = 100.0, wind_speed: float = 2.0,
-                          temperature: float = 25.0, humidity: float = 60.0,
-                          wind_angle: float = 90.0, time_interval: float = 1.0) -> float:
+def estimate_flight_energy(power_model: LSTMTransformerPowerModel, distance: float,
+                          speed: float = 10.0, height: float = 100.0,
+                          wind_speed: float = 2.0, temperature: float = 25.0,
+                          humidity: float = 60.0, wind_angle: float = 90.0,
+                          payload: float = 0.0, time_interval: float = 1.0) -> float:
     """
-    估算一段飞行的能耗（基于LSTM序列预测）
+    估算一段飞行的能耗
     
     参数:
-        power_model: LSTM功率预测模型
+        power_model: LSTM-Transformer功率预测模型
         distance: 飞行距离 [m]
-        speed: 飞行速度 [m/s]
-        height: 飞行高度 [m]
-        wind_speed: 风速 [m/s]
-        temperature: 温度 [°C]
-        humidity: 湿度 [%]
-        wind_angle: 风向夹角 [度]
-        time_interval: 采样时间间隔 [秒]
+        payload: 载重 [kg]
+        其他参数: 速度、高度、风速、温度、湿度、风向夹角
         
     返回:
         估算能耗 [kWh]
     """
-    # 计算飞行时间和采样点数
-    flight_time = distance / speed  # 秒
+    flight_time = distance / speed
     num_points = max(1, int(flight_time / time_interval))
     
-    # 构建特征序列（假设匀速平飞）
+    # 构建特征序列（匹匀速平飞，含 payload）
     feature_sequence = np.array([
-        [height, 0.0, speed, wind_speed, temperature, humidity, wind_angle]
+        [height, 0.0, speed, wind_speed, temperature, humidity, wind_angle, payload]
         for _ in range(num_points)
     ])
     
-    # 使用LSTM预测功率序列
     power_sequence = power_model.predict_power_sequence(feature_sequence)
-    
-    # 计算总能耗
-    total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
-    
-    return total_energy
+    return power_model.calculate_sequence_energy(power_sequence, time_interval)
 
 
-def predict_flight_plan_energy(power_model: LSTMPowerModel, 
+def predict_flight_plan_energy(power_model: LSTMTransformerPowerModel,
                                flight_plan: List[Dict],
                                time_interval: float = 1.0) -> Tuple[np.ndarray, float]:
     """
     根据预设飞行计划预测功率序列和总能耗
     
     参数:
-        power_model: LSTM功率预测模型
+        power_model: LSTM-Transformer功率预测模型
         flight_plan: 飞行计划列表，每个点包含:
-            - height: 高度 [m]
-            - VS: 竖直速度 [m/s]
-            - GS: 地速 [m/s]
-            - wind_speed: 风速 [m/s]
-            - temperature: 温度 [°C]
-            - humidity: 湿度 [%]
-            - wind_angle: 风向夹角 [度]
+            - height, VS, GS, wind_speed, temperature, humidity, wind_angle, payload
         time_interval: 采样时间间隔 [秒]
         
     返回:
@@ -1007,7 +645,7 @@ def predict_flight_plan_energy(power_model: LSTMPowerModel,
     if not flight_plan:
         return np.array([]), 0.0
     
-    # 构建特征序列
+    # 构建特征序列（含 payload 第8列）
     feature_sequence = np.array([
         [
             point.get('height', 100.0),
@@ -1016,7 +654,8 @@ def predict_flight_plan_energy(power_model: LSTMPowerModel,
             point.get('wind_speed', 2.0),
             point.get('temperature', 25.0),
             point.get('humidity', 60.0),
-            point.get('wind_angle', 90.0)
+            point.get('wind_angle', 90.0),
+            point.get('payload', 0.0)
         ]
         for point in flight_plan
     ])
@@ -1028,3 +667,295 @@ def predict_flight_plan_energy(power_model: LSTMPowerModel,
     total_energy = power_model.calculate_sequence_energy(power_sequence, time_interval)
     
     return power_sequence, total_energy
+
+
+# ==================== 多行程无人机路径建模 ====================
+
+@dataclass
+class EvaluationResult:
+    """多行程无人机路径评估结果"""
+    total_distance: float
+    total_energy: float
+    total_delay: float
+    penalties: Dict[str, float]
+    total_penalty: float
+    objective_cost: float
+    visited_customers: Set[int]
+    unvisited_customers: Set[int]
+    arc_payloads: Dict[Tuple[int, int], float]
+    drone_schedules: Dict[int, List[Tuple[int, float]]]
+
+
+class MTDRPSolution:
+    """多行程无人机路径解的表示"""
+
+    def __init__(self, instance: MTDRPInstance):
+        self.instance = instance
+        # routes[drone_id] = [trip1, trip2, ...]，trip 为客户ID列表
+        self.routes: Dict[int, List[List[int]]] = {k: [] for k in range(instance.num_drones)}
+
+    def add_trip(self, drone_id: int, customers: List[int]):
+        """为指定无人机添加一个行程"""
+        if not customers:
+            return
+        self.routes.setdefault(drone_id, [])
+        self.routes[drone_id].append(customers)
+
+    def get_all_trips(self) -> List[Tuple[int, int, List[int]]]:
+        """返回所有行程 (drone_id, trip_idx, customers)"""
+        trips: List[Tuple[int, int, List[int]]] = []
+        for drone_id, drone_trips in self.routes.items():
+            for trip_idx, customers in enumerate(drone_trips):
+                trips.append((drone_id, trip_idx, customers))
+        return trips
+
+    def get_visited_customers(self) -> Set[int]:
+        """返回所有已访问客户集合"""
+        visited: Set[int] = set()
+        for drone_trips in self.routes.values():
+            for trip in drone_trips:
+                visited.update(trip)
+        return visited
+
+    def is_complete(self) -> bool:
+        """是否已覆盖所有客户"""
+        required = {c.id for c in self.instance.customers}
+        return self.get_visited_customers() == required
+
+
+class MTDRPModel:
+    """多行程无人机路径问题建模与评估器"""
+
+    def __init__(
+        self,
+        instance: MTDRPInstance,
+        power_model: Optional[LSTMTransformerPowerModel] = None,
+        energy_weight: float = 1000.0,
+        battery_swap_time: float = 5.0,
+        environment: Optional[Dict[str, float]] = None,
+    ):
+        self.instance = instance
+        self.power_model = power_model or LSTMTransformerPowerModel()
+        self.energy_weight = energy_weight
+        self.battery_swap_time = battery_swap_time
+        self.environment = environment or {
+            'cruise_height': 120.0,
+            'cruise_speed': instance.drone_params.speed,
+            'vertical_speed': 3.0,
+            'wind_speed': 2.0,
+            'temperature': 25.0,
+            'humidity': 60.0,
+            'wind_angle': 90.0,
+        }
+        self.customer_map: Dict[int, Customer] = {c.id: c for c in self.instance.customers}
+        # 客户ID到矩阵索引映射
+        self.node_index: Dict[int, int] = {0: 0}
+        for idx, customer in enumerate(self.instance.customers, start=1):
+            self.node_index[customer.id] = idx
+
+    def evaluate(self, solution: MTDRPSolution) -> Tuple[float, float, Dict[str, float]]:
+        """评估解的目标函数与约束，返回 (目标值, 罚则, 详情)"""
+        result = self._evaluate_solution(solution)
+        details = {
+            'total_energy': result.total_energy,
+            'total_distance': result.total_distance,
+            'total_delay': result.total_delay,
+            'penalties': result.penalties,
+            'total_penalty': result.total_penalty,
+            'num_trips': sum(len(v) for v in solution.routes.values()),
+            'visited_customers': len(result.visited_customers),
+            'unvisited_customers': len(result.unvisited_customers),
+            'arc_payloads': result.arc_payloads,
+            'drone_schedules': result.drone_schedules,
+        }
+        return result.objective_cost, result.total_penalty, details
+
+    # -------------------- 内部评估逻辑 --------------------
+
+    def _evaluate_solution(self, solution: MTDRPSolution) -> EvaluationResult:
+        total_energy = 0.0
+        total_distance = 0.0
+        total_delay = 0.0
+        penalties: Dict[str, float] = {
+            'unvisited': 0.0,
+            'duplicate': 0.0,
+            'capacity': 0.0,
+            'energy': 0.0,
+            'energy_midway': 0.0,
+            'time_window': 0.0,
+        }
+        visited: Set[int] = set()
+        arc_payloads: Dict[Tuple[int, int], float] = {}
+        drone_schedules: Dict[int, List[Tuple[int, float]]] = {k: [] for k in solution.routes.keys()}
+
+        for drone_id, trips in solution.routes.items():
+            available_time = 0.0
+            for trip_idx, trip in enumerate(trips):
+                trip_result = self._evaluate_trip(
+                    trip=trip,
+                    already_visited=visited,
+                    start_time=available_time,
+                    arc_payloads=arc_payloads,
+                )
+
+                total_energy += trip_result['energy']
+                total_distance += trip_result['distance']
+                total_delay += trip_result['delay']
+
+                for key in penalties:
+                    penalties[key] += trip_result['penalties'].get(key, 0.0)
+
+                visited.update(trip)
+                end_time = trip_result['end_time']
+                drone_schedules.setdefault(drone_id, []).append((trip_idx, end_time))
+                available_time = end_time + self.battery_swap_time
+
+        required = {c.id for c in self.instance.customers}
+        unvisited = required - visited
+        penalties['unvisited'] = len(unvisited) * 10000.0
+
+        total_penalty = sum(penalties.values())
+        objective_cost = total_distance + self.energy_weight * total_energy
+
+        return EvaluationResult(
+            total_distance=total_distance,
+            total_energy=total_energy,
+            total_delay=total_delay,
+            penalties=penalties,
+            total_penalty=total_penalty,
+            objective_cost=objective_cost,
+            visited_customers=visited,
+            unvisited_customers=unvisited,
+            arc_payloads=arc_payloads,
+            drone_schedules=drone_schedules,
+        )
+
+    def _evaluate_trip(
+        self,
+        trip: List[int],
+        already_visited: Set[int],
+        start_time: float,
+        arc_payloads: Dict[Tuple[int, int], float],
+    ) -> Dict[str, float]:
+        """评估单条行程，返回局部统计"""
+        result = {
+            'energy': 0.0,
+            'distance': 0.0,
+            'delay': 0.0,
+            'end_time': start_time,
+            'penalties': {},
+        }
+
+        if not trip:
+            return result
+
+        penalties: Dict[str, float] = {}
+        current_node = 0
+        current_time = start_time
+
+        current_payload = sum(
+            self._get_customer(cust_id).demand for cust_id in trip if self._get_customer(cust_id) is not None
+        )
+
+        if current_payload > self.instance.drone_params.Q:
+            penalties['capacity'] = (current_payload - self.instance.drone_params.Q) * 1000.0
+
+        cumulative_energy = 0.0
+
+        for cust_id in trip:
+            customer = self._get_customer(cust_id)
+            if customer is None:
+                continue
+
+            if cust_id in already_visited:
+                penalties['duplicate'] = penalties.get('duplicate', 0.0) + 5000.0
+
+            arc_payloads[(current_node, cust_id)] = current_payload
+
+            energy, distance, travel_time = self._calculate_arc_energy(current_node, cust_id, current_payload)
+            cumulative_energy += energy
+            result['distance'] += distance
+
+            if cumulative_energy > self.instance.drone_params.sigma:
+                penalties['energy_midway'] = penalties.get('energy_midway', 0.0) + \
+                    (cumulative_energy - self.instance.drone_params.sigma) * 5000.0
+
+            arrival_time = current_time + travel_time
+            if arrival_time < customer.earliest_time:
+                current_time = customer.earliest_time + customer.service_time
+            elif arrival_time > customer.latest_time:
+                delay = arrival_time - customer.latest_time
+                result['delay'] += delay
+                penalties['time_window'] = penalties.get('time_window', 0.0) + delay * 100.0
+                current_time = arrival_time + customer.service_time
+            else:
+                current_time = arrival_time + customer.service_time
+
+            result['energy'] += energy
+            current_payload -= customer.demand
+            current_node = cust_id
+
+        arc_payloads[(current_node, 0)] = current_payload
+        energy_back, distance_back, travel_time_back = self._calculate_arc_energy(current_node, 0, current_payload)
+        result['energy'] += energy_back
+        result['distance'] += distance_back
+        cumulative_energy += energy_back
+        current_time += travel_time_back
+
+        if cumulative_energy > self.instance.drone_params.sigma:
+            penalties['energy'] = penalties.get('energy', 0.0) + \
+                (cumulative_energy - self.instance.drone_params.sigma) * 10000.0
+
+        result['end_time'] = current_time
+        result['penalties'] = penalties
+        return result
+
+    # -------------------- 工具函数 --------------------
+
+    def _get_customer(self, cust_id: int) -> Optional[Customer]:
+        return self.customer_map.get(cust_id)
+
+    def _calculate_arc_energy(self, from_node: int, to_node: int, payload: float) -> Tuple[float, float, float]:
+        """计算弧 (i,j) 的能耗、距离与飞行时间"""
+        from_idx = self.node_index.get(from_node)
+        to_idx = self.node_index.get(to_node)
+        if from_idx is None or to_idx is None:
+            return 0.0, 0.0, 0.0
+
+        distance = float(self.instance.distance_matrix[from_idx, to_idx])
+        if distance <= 0:
+            return 0.0, 0.0, 0.0
+
+        cruise_height = self.environment.get('cruise_height', 120.0)
+        cruise_speed = self.environment.get('cruise_speed', self.instance.drone_params.speed)
+        vertical_speed = self.environment.get('vertical_speed', 3.0)
+        wind_speed = self.environment.get('wind_speed', 2.0)
+        temperature = self.environment.get('temperature', 25.0)
+        humidity = self.environment.get('humidity', 60.0)
+        wind_angle = self.environment.get('wind_angle', 90.0)
+
+        energy_kwh, total_time_seconds = self.power_model.predict_arc_energy(
+            distance=distance,
+            cruise_height=cruise_height,
+            cruise_speed=cruise_speed,
+            vertical_speed=vertical_speed,
+            wind_speed=wind_speed,
+            temperature=temperature,
+            humidity=humidity,
+            wind_angle=wind_angle,
+            payload=payload,
+            time_interval=1.0,
+        )
+
+        travel_time_minutes = total_time_seconds / 60.0
+        return energy_kwh, distance, travel_time_minutes
+
+
+def build_mtdrp_model(
+    instance: MTDRPInstance,
+    model_type: str = "lstm_transformer",
+    **kwargs,
+) -> MTDRPModel:
+    """构建多行程无人机路径模型，默认使用 LSTM-Transformer 能耗预测"""
+    power_model = create_power_model(model_type, instance)
+    return MTDRPModel(instance=instance, power_model=power_model, **kwargs)
